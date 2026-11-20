@@ -9,7 +9,7 @@
 #include "irenc.h"
 #include "irfile.h"
 
-#define ROOT_DIR "sdmc:/3ds/irremote"
+#define ROOT_DIR "sdmc:/3ds/3dsir"
 #define IRU_MAX_TRANSFER 0x800
 #define LIST_ROWS 26
 

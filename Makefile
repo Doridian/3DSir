@@ -31,8 +31,8 @@ include $(DEVKITARM)/3ds_rules
 #     - icon.png
 #     - <libctru folder>/default_icon.png
 #---------------------------------------------------------------------------------
-TARGET		:=	irremote
-APP_TITLE	:=	IR Remote
+TARGET		:=	3dsir
+APP_TITLE	:=	3DSir
 APP_DESCRIPTION	:=	Universal TV remote via the IR port
 APP_AUTHOR	:=	doridian
 BUILD		:=	build
@@ -55,7 +55,7 @@ CFLAGS	:=	-g -Wall -O2 -mword-relocations \
 
 CFLAGS	+=	$(INCLUDE) -D__3DS__
 
-# make cia: the same build as an installable CIA, irremote.cia (makerom + bannertool on the PATH, or
+# make cia: the same build as an installable CIA, 3dsir.cia (makerom + bannertool on the PATH, or
 # MAKEROM= / BANNERTOOL=)
 MAKEROM		?=	makerom
 BANNERTOOL	?=	bannertool
@@ -177,7 +177,7 @@ cia: all
 	@$(BANNERTOOL) makebanner -i $(TOPDIR)/meta/banner.png -a $(TOPDIR)/meta/banner.wav -o $(BUILD)/banner.bnr
 	@$(BANNERTOOL) makesmdh -s "$(APP_TITLE)" -l "$(APP_DESCRIPTION)" -p "$(APP_AUTHOR)" \
 		-i $(APP_ICON) -o $(BUILD)/icon.icn
-	@$(MAKEROM) -f cia -o $(OUTPUT).cia -target t -exefslogo -elf $(OUTPUT).elf -rsf $(TOPDIR)/meta/irremote.rsf \
+	@$(MAKEROM) -f cia -o $(OUTPUT).cia -target t -exefslogo -elf $(OUTPUT).elf -rsf $(TOPDIR)/meta/3dsir.rsf \
 		-banner $(BUILD)/banner.bnr -icon $(BUILD)/icon.icn
 	@echo built ... $(notdir $(OUTPUT).cia)
 

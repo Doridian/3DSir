@@ -1,11 +1,11 @@
 # makerom spec for the CIA (make cia).
 #
-# A .3dsx inherits the Homebrew Launcher's access; a CIA only gets what is listed here. IR Remote needs
+# A .3dsx inherits the Homebrew Launcher's access; a CIA only gets what is listed here. 3DSir needs
 # nothing unusual beyond ir:u, the IR port's UART.
 
 BasicInfo:
-  Title                   : IRRemote
-  ProductCode             : CTR-H-IRRM
+  Title                   : 3DSir
+  ProductCode             : CTR-H-3DIR
   Logo                    : Homebrew
 
 RomFs:
