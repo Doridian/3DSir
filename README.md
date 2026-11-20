@@ -1,4 +1,4 @@
-# 3DS IR Remote
+# 3DSir
 
 An experiment to turn the 3DS infrared port into a universal TV remote.
 
@@ -88,6 +88,18 @@ transmission off after about 10 ms. Wait for `GetSendFinishedEvent` and poll
 3. `SetIRLEDState` isn't needed to transmit. Enabling it gives one brief flash
    that the hardware ends on its own.
 
+## Download
+
+**[Latest release](https://github.com/Doridian/3DSir/releases/latest)**: get `3DSir.3dsx` or `3DSir.cia`.
+CI builds every `v*` tag into a release:
+
+| File | For |
+| --- | --- |
+| `3DSir.3dsx` | The Homebrew Launcher. |
+| `3DSir.cia` | The same build, to install to the HOME menu (e.g. with FBI). |
+
+Builds of every commit are attached to its CI run as artifacts.
+
 ## Usage
 
 Build with devkitARM:
@@ -96,10 +108,16 @@ Build with devkitARM:
 docker run --rm -v "$PWD":/src:Z -w /src docker.io/devkitpro/devkitarm make
 ```
 
-Copy `irremote.3dsx` to `sdmc:/3ds/` and launch it from the Homebrew Launcher
-(Luma3DS gives it `ir:u` access).
+`make cia` also builds `3dsir.cia`; it needs
+[makerom](https://github.com/3DSGuy/Project_CTR) and
+[bannertool](https://github.com/diasurgical/bannertool) on the `PATH` (or `MAKEROM=` / `BANNERTOOL=`).
+The icon, HOME menu banner and jingle are drawn by `meta/make_art.py`.
 
-Put Flipper Zero `.ir` files in `sdmc:/3ds/irremote/`. Subfolders work, so the
+Copy `3DSir.3dsx` (or a local build's `3dsir.3dsx`) to `sdmc:/3ds/` and launch it from the Homebrew Launcher
+(Luma3DS gives it `ir:u` access), or install `3DSir.cia` and launch it from
+the HOME menu.
+
+Put Flipper Zero `.ir` files in `sdmc:/3ds/3dsir/`. Subfolders work, so the
 whole [Flipper-IRDB](https://github.com/Lucaslhm/Flipper-IRDB) can go there.
 The Flipper firmware's universal `tv.ir`
 (`applications/main/infrared/resources/infrared/assets/tv.ir`) is the most
