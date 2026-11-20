@@ -55,6 +55,11 @@ CFLAGS	:=	-g -Wall -O2 -mword-relocations \
 
 CFLAGS	+=	$(INCLUDE) -D__3DS__
 
+# make cia: the same build as an installable CIA, irremote.cia (makerom + bannertool on the PATH, or
+# MAKEROM= / BANNERTOOL=)
+MAKEROM		?=	makerom
+BANNERTOOL	?=	bannertool
+
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 
 ASFLAGS	:=	-g $(ARCH)
@@ -161,11 +166,20 @@ ifneq ($(ROMFS),)
 	export _3DSXFLAGS += --romfs=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: all clean
+.PHONY: all clean cia
 
 #---------------------------------------------------------------------------------
 all: $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+
+# HOME menu banner (meta/banner.png + jingle) and icon (icon.png, as for the .3dsx); meta/make_art.py draws them
+cia: all
+	@$(BANNERTOOL) makebanner -i $(TOPDIR)/meta/banner.png -a $(TOPDIR)/meta/banner.wav -o $(BUILD)/banner.bnr
+	@$(BANNERTOOL) makesmdh -s "$(APP_TITLE)" -l "$(APP_DESCRIPTION)" -p "$(APP_AUTHOR)" \
+		-i $(APP_ICON) -o $(BUILD)/icon.icn
+	@$(MAKEROM) -f cia -o $(OUTPUT).cia -target t -exefslogo -elf $(OUTPUT).elf -rsf $(TOPDIR)/meta/irremote.rsf \
+		-banner $(BUILD)/banner.bnr -icon $(BUILD)/icon.icn
+	@echo built ... $(notdir $(OUTPUT).cia)
 
 $(BUILD):
 	@mkdir -p $@
@@ -183,7 +197,7 @@ endif
 #---------------------------------------------------------------------------------
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf $(GFXBUILD)
+	@rm -fr $(BUILD) $(TARGET).3dsx $(TARGET).cia $(OUTPUT).smdh $(TARGET).elf $(GFXBUILD)
 
 #---------------------------------------------------------------------------------
 $(GFXBUILD)/%.t3x	$(BUILD)/%.h	:	%.t3s
