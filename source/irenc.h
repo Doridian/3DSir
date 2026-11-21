@@ -61,5 +61,8 @@ const IrCarrier* ir_pick_carrier(uint32_t freq, IrCarrierStyle style);
 // (out may be NULL to just measure).
 size_t ir_render_uart(const IrTimings* tm, const IrCarrier* c, uint8_t* out, size_t out_max);
 
+// Microseconds ir_render_uart takes off the end of every mark (and adds to the next space).
+extern int32_t ir_mark_trim_us;
+
 // The byte ir_render_uart emits for a UART frame that lies entirely in a space.
 uint8_t ir_space_byte(const IrCarrier* c);

@@ -42,11 +42,20 @@ enum {
 #define SC_THR SC_RHR
 #define SC_FCR SC_IIR
 
-// Stops the ir module (closing ir:u is the caller's job), opens i2c::IR + gpio:IR and
-// masks the UART's interrupts (IER = 0), so nothing signals the dead module's IRQ event.
-Result irhw_takeover(void);
-// Closes our sessions and relaunches the ir module.
-void irhw_give_back(void);
+// Opens i2c::IR next to the (idle) ir module and masks the UART's interrupts (IER = 0).
+// Closing ir:u first is the caller's job.
+// IRHW_KILL stops the ir module first. ir ignores PM's terminate, so that is a hard kill, and
+// gpio then crashes (0xD8E007F7) when a gpio:IR session opened afterwards closes.
+// IRHW_GPIO also opens gpio:IR.
+// IRHW_STEAL instead takes a second handle to the ir module's own i2c::IR session (Luma3DS's
+// svcControlService) and saves the registers; give-back restores them. Nothing is killed.
+enum { IRHW_KILL = 1, IRHW_GPIO = 2, IRHW_STEAL = 4 };
+Result irhw_takeover(u32 flags);
+// Closes our sessions and relaunches the ir module if we killed it. False when that can't be
+// done: the killed ir never finishes dying, and only a reboot brings the IR stack back.
+bool irhw_give_back(void);
+// Reboots the console (APT, then the kernel directly). Doesn't return.
+void irhw_reboot(void);
 bool irhw_owned(void);
 
 Result irhw_i2c_write(u8 dev, const void* buf, u32 size); // I2C cmd 0x14 WriteDeviceRaw

@@ -19,6 +19,8 @@ static const IrCarrier clean_carriers[] = {
     {115200, 3, 2},
 };
 
+int32_t ir_mark_trim_us;
+
 static bool rc5_toggle;
 static bool rc6_toggle;
 
@@ -231,6 +233,11 @@ uint8_t ir_space_byte(const IrCarrier* c) {
     return c->cycle_slots == 2 ? 0xE6 : 0xFF;
 }
 
+static uint32_t trim_of(uint32_t mark_us) {
+    if(ir_mark_trim_us <= 0) return 0;
+    return (uint32_t)ir_mark_trim_us < mark_us / 2 ? (uint32_t)ir_mark_trim_us : mark_us / 2;
+}
+
 static uint64_t us_to_slot(uint64_t us, uint32_t baud) {
     return (us * baud + 500000) / 1000000;
 }
@@ -242,9 +249,13 @@ size_t ir_render_uart(const IrTimings* tm, const IrCarrier* c, uint8_t* out, siz
 
     // Bit slot k (at 1/baud resolution) is lit iff it falls inside a mark.
     // Each UART frame covers 10 slots: start (always lit), 8 data, stop (always dark).
+    // Mark ends move ir_mark_trim_us earlier (at most half the mark), the following space
+    // grows by as much: the start-bit pulses around a mark's edges stretch it at the receiver.
+#define SEG_END_SLOT() \
+    us_to_slot(seg_end_us - (seg % 2 ? 0 : trim_of(tm->t[seg])), baud)
     size_t seg = 0;
     uint64_t seg_end_us = tm->n ? tm->t[0] : 0;
-    uint64_t seg_end_slot = us_to_slot(seg_end_us, baud);
+    uint64_t seg_end_slot = tm->n ? SEG_END_SLOT() : 0;
 
     for(size_t f = 0; f < frames; f++) {
         uint8_t byte = 0xFF;
@@ -253,8 +264,10 @@ size_t ir_render_uart(const IrTimings* tm, const IrCarrier* c, uint8_t* out, siz
             uint64_t slot = f * 10 + b;
             while(seg < tm->n && slot >= seg_end_slot) {
                 seg++;
-                if(seg < tm->n) seg_end_us += tm->t[seg];
-                seg_end_slot = us_to_slot(seg_end_us, baud);
+                if(seg < tm->n) {
+                    seg_end_us += tm->t[seg];
+                    seg_end_slot = SEG_END_SLOT();
+                }
             }
             bool mark = seg < tm->n && (seg % 2) == 0;
             in_mark |= mark;
