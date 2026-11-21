@@ -7,6 +7,7 @@
 
 #include "app.h"
 #include "log.h"
+#include "version.h" // the Makefile writes it into build/
 
 static const Screen* stack[16];
 static int depth;
@@ -294,7 +295,7 @@ void menu_input(Menu* m, u32 down, u32 repeat) {
 
 void menu_draw(Menu* m) {
 #ifdef APP_RELEASE
-    ui_header(m->title, NULL);
+    ui_header(m->title, APP_VERSION_TAGGED ? APP_VERSION : NULL); // a tagged release says which
 #else
     ui_header(m->title, *net_addr ? net_addr : "no network");
 #endif

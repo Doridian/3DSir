@@ -8,6 +8,7 @@
 #include "app.h"
 #include "irdb.h"
 #include "log.h"
+#include "version.h" // the Makefile writes it into build/
 
 #define LOG_PATH "sdmc:/3dsir.log" // debug build only
 
@@ -71,10 +72,10 @@ int main(int argc, char* argv[]) {
     LightLock_Init(&hw_lock);
 #ifdef APP_RELEASE
     log_init(NULL);
-    logp("3DSir (built " __DATE__ " " __TIME__ ")\n");
+    logp("3DSir " APP_VERSION " (built " __DATE__ " " __TIME__ ")\n");
 #else
     log_init(LOG_PATH);
-    logp("--- 3DSir debug (built " __DATE__ " " __TIME__ ") ---\n");
+    logp("--- 3DSir " APP_VERSION " debug (built " __DATE__ " " __TIME__ ") ---\n");
     logp("app: %s\n", app_path);
     net_start();
 #endif
