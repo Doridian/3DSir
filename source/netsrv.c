@@ -1,6 +1,6 @@
 // Debug build only: a TCP server so the PC side (tools/irnet.py) can run IR experiments,
 // send codes, update the app and drive its UI without rebuilding or touching the console.
-// Same framing as Prox3DS. One client at a time.
+// Same framing as Prox3DS. Up to three clients, each on its own thread.
 //
 // Request:  op u8, len u16 LE, payload
 // Response: op u8, result u32 LE, len u16 LE, payload
@@ -26,8 +26,11 @@
 
 enum {
     OP_PING = 0x00, // -> "3DSir"
-    OP_TAKEOVER = 0x01, // stop ir:u and the ir module, open i2c::IR / gpio:IR, IER = 0
-    OP_RELEASE = 0x02, // close them, relaunch the ir module, reopen ir:u
+    OP_TAKEOVER = 0x01, // [flags u8, default 4: 4 steal the ir module's i2c::IR session (Luma's
+                        // svcControlService) and save the registers; 1 kill the ir module instead;
+                        // 2 open gpio:IR] close ir:u, IER = 0, transceiver/TX/RX/FIFOs on
+    OP_RELEASE = 0x02, // after a steal: restore the registers, close our handle, reopen ir:u. After a
+                       // kill this reboots: the killed ir never finishes dying
     OP_REG_READ = 0x03, // reg u8, count u8 -> count bytes of that register (RHR: FIFO bytes)
     OP_REG_WRITE = 0x04, // reg u8, bytes (THR: into the FIFO)
     OP_GPIO = 0x05, // value u32, mask u32 (0 = no write), read mask u32 -> u32 data
@@ -39,17 +42,21 @@ enum {
     OP_PUT_FILE = 0x0A, // offset u32 (0 = new file), path len u8, path (under sdmc:/3ds/3dsir/), data
     OP_BENCH = 0x0B, // n u16 -> min, avg, max u32: microseconds per single-register I2C read
     OP_TX = 0x0C, // bytes -> through the TX FIFO as fast as I2C allows; waits for the shifter to
-                  // drain -> elapsed us u32, writes u32, times the FIFO was found empty u32
+                  // drain -> elapsed us u32, writes u32, times the FIFO was found empty u32, bytes sent u32
+                  // (short when TXLVL stayed 0 for 2 s)
     OP_RX = 0x0D, // ms u16 -> polls RXLVL for that long and drains the FIFO: polls u32, elapsed us
                   // u32, samples u32, then per sample: t us u32, n u8, n bytes
     OP_SEND = 0x0E, // a code through ir:u. kind u8, style u8, repeats u8, then kind 0 (parsed):
                     // protocol char[16], address u32, command u32; kind 1 (raw): freq u32, count
                     // u16, count u32 timings -> bytes rendered u32
     OP_IRU_SEND = 0x0F, // bitrate value u8, bytes: raw through ir:u -> us u32 until on air
+    OP_SET_TRIM = 0x10, // trim s32: ir_mark_trim_us for every later send, either style (by default
+                        // clean gets 80, dense 0) -> the old value s32
     // UI debugging, served without hw_lock:
-    OP_SHOT = 0x20, // offset u32 -> up to OUT_MAX bytes of the top framebuffer (240x400 BGR8)
+    OP_SHOT = 0x20, // offset u32 -> up to OUT_MAX bytes of the top framebuffer (240x400, the screen's format: RGB565 under the console)
     OP_KEYS = 0x21, // keys u32 (KEY_*) -> pressed for one frame of the UI
     OP_LOG = 0x24, // lines u32 -> the last that many log lines, '\n' each
+    OP_GET_FILE = 0x25, // offset u32, path (any sdmc:/ file) -> up to OUT_MAX bytes from there
 };
 
 #define OUT_MAX 0xF000
@@ -105,6 +112,17 @@ static u32 get32(const u8* p) {
 static Result handle_debug(u8 op, const u8* in, u32 in_len, u8* out, u16* out_len) {
     if(in_len < 4) return -3;
     u32 v = get32(in);
+    if(op == OP_GET_FILE) {
+        char path[256];
+        u32 k = in_len - 4 < sizeof(path) - 1 ? in_len - 4 : sizeof(path) - 1;
+        memcpy(path, in + 4, k);
+        path[k] = 0;
+        FILE* f = fopen(path, "rb");
+        if(!f) return -5;
+        if(!fseek(f, v, SEEK_SET)) *out_len = fread(out, 1, OUT_MAX, f);
+        fclose(f);
+        return 0;
+    }
     if(op == OP_KEYS) {
         __atomic_or_fetch(&net_keys, v, __ATOMIC_SEQ_CST);
         return 0;
@@ -124,7 +142,7 @@ static Result handle_debug(u8 op, const u8* in, u32 in_len, u8* out, u16* out_le
     }
     u16 w, h;
     u8* fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &w, &h);
-    u32 size = w * h * 3;
+    u32 size = w * h * gspGetBytesPerPixel(gfxGetScreenFormat(GFX_TOP));
     if(v < size) {
         *out_len = size - v < OUT_MAX ? size - v : OUT_MAX;
         GSPGPU_InvalidateDataCache(fb + v, *out_len);
@@ -175,13 +193,19 @@ static Result handle_put_file(const u8* in, u32 in_len) {
 // Pushes bytes through the 64-byte TX FIFO, topping it up whenever TXLVL shows room.
 static Result direct_tx(const u8* data, u32 n, u8* out, u16* out_len) {
     u32 sent = 0, writes = 0, empty = 0;
-    u64 t0 = svcGetSystemTick();
+    u64 t0 = svcGetSystemTick(), last = t0;
     while(sent < n) {
         u8 room = 0;
         Result rc = sc_get(SC_TXLVL, &room);
         if(R_FAILED(rc)) return rc;
         if(room > 64) room = 64;
-        if(!room) continue;
+        if(!room) {
+            // The FIFO stopped draining (transmitter disabled, or no clock): give up rather than
+            // hold the hardware lock and the connection forever.
+            if(svcGetSystemTick() - last > 2ULL * SYSCLOCK_ARM11) break;
+            continue;
+        }
+        last = svcGetSystemTick();
         if(room == 64 && sent) empty++; // it ran dry: there was a gap on air
         u32 k = n - sent < room ? n - sent : room;
         rc = sc_write(SC_THR, data + sent, k);
@@ -190,14 +214,19 @@ static Result direct_tx(const u8* data, u32 n, u8* out, u16* out_len) {
         writes++;
     }
     // LSR[6]: THR and TSR empty, the last stop bit is out.
-    for(int i = 0; i < 1000; i++) {
+    // Bounded: with the transmitter disabled (EFCR[2], how the ir module leaves it) it never drains.
+    bool drained = false;
+    for(int i = 0; i < 1000 && !drained; i++) {
         u8 lsr = 0;
-        if(R_FAILED(sc_get(SC_LSR, &lsr)) || (lsr & 0x40)) break;
+        if(R_FAILED(sc_get(SC_LSR, &lsr))) break;
+        drained = lsr & 0x40;
     }
+    if(!drained) sent |= 0x80000000;
     put32(out, irhw_us(svcGetSystemTick() - t0));
     put32(out + 4, writes);
     put32(out + 8, empty);
-    *out_len = 12;
+    put32(out + 12, sent);
+    *out_len = 16;
     return 0;
 }
 
@@ -206,7 +235,9 @@ static Result direct_tx(const u8* data, u32 n, u8* out, u16* out_len) {
 static Result direct_rx(u32 ms, u8* out, u16* out_len) {
     u32 polls = 0, samples = 0, o = 12;
     u64 t0 = svcGetSystemTick(), end = t0 + (u64)ms * SYSCLOCK_ARM11 / 1000;
-    Result rc = 0;
+    // Flush first: the transceiver hears its own TX, which fills the FIFO and drops what follows.
+    Result rc = sc_set(SC_FCR, 0x03);
+    if(R_FAILED(rc)) return rc;
     for(;;) {
         u64 now = svcGetSystemTick();
         if(now >= end) break;
@@ -270,7 +301,7 @@ static Result handle_send(const u8* in, u32 in_len, u8* out, u16* out_len) {
 static Result handle_hw(u8 op, const u8* in, u32 in_len, u8* out, u16* out_len) {
     switch(op) {
     case OP_TAKEOVER:
-        return app_hw_direct();
+        return app_hw_direct(in_len ? in[0] : IRHW_STEAL);
     case OP_RELEASE:
         app_hw_iru();
         return 0;
@@ -346,18 +377,38 @@ static Result handle_hw(u8 op, const u8* in, u32 in_len, u8* out, u16* out_len) 
     return -4; // unknown op
 }
 
-static void serve_client(int fd) {
-    static u8 in[0x8000] __attribute__((aligned(4))), out[OUT_MAX] __attribute__((aligned(4)));
+#define IN_MAX 0x8000
+#define MAX_CLIENTS 3
+
+// One thread per client, so a hardware call that never returns (it holds hw_lock) doesn't take
+// log, get, shot and update down with it.
+static struct Client {
+    Thread thread;
+    int fd;
+    volatile bool busy;
+    u8* in;
+    u8* out;
+} clients[MAX_CLIENTS];
+
+static void serve_client(int fd, u8* in, u8* out) {
     for(;;) {
         u8 hdr[3];
         if(!recv_all(fd, hdr, 3)) return;
         u32 len = hdr[1] | (hdr[2] << 8);
-        if(len > sizeof(in) || !recv_all(fd, in, len)) return;
+        if(len > IN_MAX || !recv_all(fd, in, len)) return;
         u16 out_len = 0;
         Result res;
         u8 op = hdr[0];
-        if(op == OP_SHOT || op == OP_KEYS || op == OP_LOG) {
+        if(op == OP_SHOT || op == OP_KEYS || op == OP_LOG || op == OP_GET_FILE) {
             res = handle_debug(op, in, len, out, &out_len);
+        } else if(op == OP_SET_TRIM) {
+            put32(out, (u32)ir_mark_trim_us);
+            out_len = 4;
+            res = len >= 4 ? 0 : -3;
+            if(!res) {
+                ir_mark_trim_us = (int32_t)get32(in);
+                trim_overridden = true;
+            }
         } else if(op == OP_PING) {
             memcpy(out, "3DSir", 5);
             out_len = 5;
@@ -375,6 +426,14 @@ static void serve_client(int fd) {
     }
 }
 
+static void client_main(void* arg) {
+    struct Client* c = arg;
+    serve_client(c->fd, c->in, c->out);
+    close(c->fd);
+    logp("net: client gone\n");
+    c->busy = false;
+}
+
 static void net_main(void* arg) {
     (void)arg;
     while(!net_quit) {
@@ -387,10 +446,33 @@ static void net_main(void* arg) {
             continue;
         }
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) & ~O_NONBLOCK);
+        struct Client* c = NULL;
+        for(int i = 0; i < MAX_CLIENTS && !c; i++)
+            if(!clients[i].busy) c = &clients[i];
+        if(!c) {
+            logp("net: client %s refused, %d busy\n", inet_ntoa(client.sin_addr), MAX_CLIENTS);
+            close(fd);
+            continue;
+        }
+        if(c->thread) {
+            threadJoin(c->thread, U64_MAX); // it already finished: busy is cleared last
+            threadFree(c->thread);
+            c->thread = NULL;
+        }
+        if(!c->in) c->in = memalign(4, IN_MAX);
+        if(!c->out) c->out = memalign(4, OUT_MAX);
+        if(!c->in || !c->out) {
+            close(fd);
+            continue;
+        }
         logp("net: client %s\n", inet_ntoa(client.sin_addr));
-        serve_client(fd);
-        close(fd);
-        logp("net: client gone\n");
+        c->fd = fd;
+        c->busy = true;
+        c->thread = threadCreate(client_main, c, 0x8000, 0x30, -2, false);
+        if(!c->thread) {
+            c->busy = false;
+            close(fd);
+        }
     }
 }
 
@@ -421,6 +503,21 @@ void net_stop(void) {
     if(net_thread) {
         threadJoin(net_thread, U64_MAX);
         threadFree(net_thread);
+    }
+    // Idle clients notice net_quit within 100 ms. One stuck in a hardware call is left behind
+    // (the process exit takes it); its buffers are leaked with it.
+    for(int i = 0; i < MAX_CLIENTS; i++) {
+        struct Client* c = &clients[i];
+        if(!c->thread) continue;
+        if(R_SUCCEEDED(threadJoin(c->thread, 1000000000ULL))) {
+            threadFree(c->thread);
+            free(c->in);
+            free(c->out);
+        } else {
+            logp("net: client thread %d stuck, leaving it\n", i);
+        }
+        c->thread = NULL;
+        c->in = c->out = NULL;
     }
     if(listen_fd >= 0) close(listen_fd);
     socExit();

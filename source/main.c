@@ -31,6 +31,7 @@ static bool iru_ok; // ir:u open (false while the hardware is taken over)
 LightLock hw_lock;
 char app_path[256] = "sdmc:/3ds/3dsir.3dsx";
 volatile bool restart_requested;
+volatile bool trim_overridden;
 
 // ---------------------------------------------------------------- input
 
@@ -58,11 +59,15 @@ static Result iru_open(void) {
     if(!iru_shm) iru_shm = memalign(0x1000, 0x1000);
     Result rc = -1;
     // Right after a relaunch the module may not have registered ir:u yet.
+    // Non-blocking: a dead ir module's ir:u port would otherwise block here forever, holding
+    // hw_lock.
+    srvSetBlockingPolicy(true);
     for(int t = 0; t < 20; t++) {
         rc = iruInit(iru_shm, 0x1000);
         if(R_SUCCEEDED(rc)) break;
         svcSleepThread(100000000LL);
     }
+    srvSetBlockingPolicy(false);
     logp("iruInit: %08lX\n", rc);
     if(R_FAILED(rc)) return rc;
     IRU_GetBitRate(&cur_bitrate);
@@ -80,9 +85,9 @@ static void iru_close(void) {
     iru_ok = false;
 }
 
-Result app_hw_direct(void) {
+Result app_hw_direct(u32 flags) {
     iru_close();
-    Result rc = irhw_takeover();
+    Result rc = irhw_takeover(flags);
     // While the ir module is gone the HOME menu would hang waiting for it.
     aptSetHomeAllowed(false);
     aptSetSleepAllowed(false);
@@ -90,7 +95,12 @@ Result app_hw_direct(void) {
 }
 
 void app_hw_iru(void) {
-    irhw_give_back(); // also when the takeover failed halfway: the module may be stopped already
+    // Also when the takeover failed halfway: the module may be stopped already.
+    if(!irhw_give_back()) {
+        // The killed ir module is stuck half-dead: ir:u calls would hang, HOME would hang.
+        logp("the ir module can't come back without a reboot\n");
+        irhw_reboot();
+    }
     iru_open();
     aptSetHomeAllowed(true);
     aptSetSleepAllowed(true);
@@ -192,6 +202,13 @@ static Result send_timings_locked(const IrTimings* tm, IrCarrierStyle st, u32* b
     Result rc = set_carrier(c);
     if(R_FAILED(rc)) return rc;
 
+    // The net server's trim command overrides this; otherwise the clean style's marks get 80 us
+    // shorter. Measured with a Flipper Zero at ~10 cm: they arrive ~80 us long, and with the trim
+    // NEC, NECext, NEC42, Samsung32, RC5, RC6, SIRC and Pioneer all decode. The dense style
+    // isn't trimmed: its stretch there comes from lone space pulses that only a close, sensitive
+    // receiver hears, and it's the one tested at TV distance.
+    int32_t saved_trim = ir_mark_trim_us;
+    if(!trim_overridden) ir_mark_trim_us = st == IrCarrierClean ? 80 : 0;
     size_t n = ir_render_uart(tm, c, NULL, 0);
     if(n > txbuf_cap) {
         free(txbuf);
@@ -199,6 +216,7 @@ static Result send_timings_locked(const IrTimings* tm, IrCarrierStyle st, u32* b
         txbuf = malloc(n);
     }
     ir_render_uart(tm, c, txbuf, n);
+    ir_mark_trim_us = saved_trim;
     if(bytes) *bytes = n;
     return send_bytes(txbuf, n, c->baud, ir_space_byte(c));
 }
@@ -470,7 +488,7 @@ static void chip_diag(void) {
     consoleClear();
     logp("\x1b[36mIR chip diagnostic\x1b[0m\n");
     LightLock_Lock(&hw_lock);
-    Result rc = app_hw_direct();
+    Result rc = app_hw_direct(IRHW_STEAL);
     if(R_SUCCEEDED(rc)) {
         irhw_dump();
         u32 mn, avg, mx;
@@ -656,10 +674,16 @@ int main(int argc, char* argv[]) {
 #ifndef APP_RELEASE
     net_stop();
 #endif
-    LightLock_Lock(&hw_lock);
-    if(!iru_ok) app_hw_iru(); // a net client left the hardware taken over
-    iru_close();
-    LightLock_Unlock(&hw_lock);
+    // A net client stuck in a hardware call holds hw_lock forever: don't wait on it to exit.
+    bool locked = false;
+    for(int i = 0; i < 20 && !(locked = !LightLock_TryLock(&hw_lock)); i++) svcSleepThread(50000000LL);
+    if(locked) {
+        if(!iru_ok) app_hw_iru(); // a net client left the hardware taken over
+        iru_close();
+        LightLock_Unlock(&hw_lock);
+    } else {
+        logp("hw_lock held by a stuck call, exiting without giving the hardware back\n");
+    }
     logp("--- exit ---\n");
     log_exit();
 

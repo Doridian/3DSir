@@ -5,19 +5,26 @@ usage: irnet.py HOST COMMAND [ARGS...]
   App:
        update [FILE]                 send a new .3dsx (default: ./3dsir.3dsx), the app restarts into it
        put LOCAL [DEST]              copy a file onto the SD card (default dest: sdmc:/3ds/3dsir/NAME)
+       get SDPATH [LOCAL]            fetch a file from the SD card (e.g. sdmc:/3dsir.log), stdout without LOCAL
        shot [OUT.png]                grab the top screen (needs Pillow)
        log [N]                       the app log's last N lines (default 50)
        keys KEY [KEY...]             press buttons, one frame each (a b x y l r up down left right start select)
   Sending through ir:u (the normal path):
        send FILE.ir NAME [REPEATS] [clean]   a signal from a Flipper .ir file on the PC
        code PROTOCOL ADDR CMD [REPEATS] [clean]   e.g. code NEC 0x04 0x08
+                                     (dense carrier by default: strongest, tested on TVs; a Flipper
+                                     right next to the port only decodes the clean one)
+       trim US                       shorten every mark by US (the next space grows) for later sends, both
+                                     styles (default: clean 80, dense 0)
        irusend BITRATE HEX           raw UART bytes at an IRU_SetBitRate value (3..18)
-  SC16IS750 direct (stops the ir module; release gives it back):
-       takeover | release
+  SC16IS750 direct (shares the ir module's own i2c::IR session; release puts the chip back as it was):
+       takeover [kill] [gpio]        kill: stop the ir module instead (release then REBOOTS the console);
+                                     gpio: also open gpio:IR (gpio crashes when that session closes)
+       release
        regs                          dump every register (special + enhanced sets, LCR restored)
        rd REG [N]                    read N bytes of register REG (RHR: FIFO bytes)
        wr REG HEX                    write bytes to register REG (THR: into the FIFO)
-       uart DIV [irda|nrz] [pre4]    baud = 1152000 / DIV (/4 more with pre4), 8N1, FIFOs reset
+       uart DIV [irda|nrz] [pre4]    baud = 1152000 / DIV (/4 more with pre4), 8N1, FIFOs reset, TX/RX on
        tx HEX | txfill BYTE COUNT    push bytes through the TX FIFO, report gaps
        rx MS                         poll and drain the RX FIFO for MS milliseconds, print the timeline
        bench [N]                     I2C single-register read round trip
@@ -34,7 +41,8 @@ import time
 PORT = 8020
 (OP_PING, OP_TAKEOVER, OP_RELEASE, OP_REG_READ, OP_REG_WRITE, OP_GPIO, OP_I2C, OP_IPC, OP_UPDATE,
  OP_UPDATE_DONE, OP_PUT_FILE, OP_BENCH, OP_TX, OP_RX, OP_SEND, OP_IRU_SEND) = range(16)
-OP_SHOT, OP_KEYS, OP_LOG = 0x20, 0x21, 0x24
+OP_SET_TRIM = 0x10
+OP_SHOT, OP_KEYS, OP_LOG, OP_GET_FILE = 0x20, 0x21, 0x24, 0x25
 CHUNK = 0x7000
 ROOT = "sdmc:/3ds/3dsir/"
 KEYS = {"a": 1 << 0, "b": 1 << 1, "select": 1 << 2, "start": 1 << 3, "right": 1 << 4, "left": 1 << 5,
@@ -100,8 +108,21 @@ class Ir:
             if not chunk:
                 break
             raw += chunk
-        img = Image.frombytes("RGB", (240, len(raw) // 720), raw, "raw", "BGR")
+        bpp = len(raw) // (240 * 400)  # the console draws in RGB565, other formats are BGR8 / ABGR8
+        mode = {2: ("BGR;16", "RGB"), 3: ("BGR", "RGB"), 4: ("ABGR", "RGBA")}[bpp]
+        img = Image.frombytes(mode[1], (240, 400), raw, "raw", mode[0])
         return img.transpose(Image.Transpose.ROTATE_90)
+
+    def get_file(self, path):
+        data = b""
+        while True:
+            chunk = self.call(OP_GET_FILE, struct.pack("<I", len(data)) + path.encode())
+            if not chunk:
+                return data
+            data += chunk
+
+    def set_trim(self, us):
+        return struct.unpack("<i", self.call(OP_SET_TRIM, struct.pack("<i", us)))[0]
 
     def log(self, lines=50):
         return self.call(OP_LOG, struct.pack("<I", lines)).decode(errors="replace")
@@ -124,8 +145,9 @@ class Ir:
         return struct.unpack("<I", self.call(OP_IRU_SEND, bytes([bitrate]) + data))[0]
 
     # SC16IS750
-    def takeover(self):
-        self.call(OP_TAKEOVER)
+    def takeover(self, kill=False, gpio=False):
+        """Steals the ir module's i2c::IR session by default; kill stops the module instead."""
+        self.call(OP_TAKEOVER, bytes([(1 if kill else 4) | gpio << 1]))
 
     def release(self):
         self.call(OP_RELEASE)
@@ -151,7 +173,7 @@ class Ir:
         return out
 
     def uart(self, div, irda=True, pre4=False):
-        """8N1 at 1152000 / div (/4 with pre4), IrDA or plain NRZ, FIFOs on and reset."""
+        """8N1 at 1152000 / div (/4 with pre4), IrDA or plain NRZ, FIFOs on and reset, TX and RX enabled."""
         lcr = 0x03
         self.wr(LCR, 0xBF)
         efr = self.rd1(EFR)
@@ -163,9 +185,12 @@ class Ir:
         mcr = self.rd1(MCR) & 0x3F
         self.wr(MCR, mcr | (0x40 if irda else 0) | (0x80 if pre4 else 0))
         self.wr(FCR, 0x07)
+        self.wr(EFCR, self.rd1(EFCR) & ~0x06)  # the ir module leaves TX and RX disabled when idle
+        self.wr(IOSTATE, self.rd1(IOSTATE) & ~1)  # and the transceiver shut down (GPIO0 = its SD pin)
 
     def tx(self, data):
-        return struct.unpack("<III", self.call(OP_TX, data))  # us, FIFO writes, times found empty
+        d = self.call(OP_TX, data)  # us, FIFO writes, times found empty, bytes sent
+        return struct.unpack("<IIII", d) if len(d) >= 16 else struct.unpack("<III", d) + (len(data),)
 
     def rx(self, ms):
         d = self.call(OP_RX, struct.pack("<H", ms))
@@ -217,7 +242,7 @@ def main():
     ir.ping()
     what, args = sys.argv[2], sys.argv[3:]
     clean = "clean" in args
-    args = [a for a in args if a != "clean"]
+    args = [a for a in args if a not in ("clean", "dense")]
     if what == "update":
         path = args[0] if args else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "3dsir.3dsx")
         ir.update(open(path, "rb").read())
@@ -226,6 +251,15 @@ def main():
         dest = args[1] if len(args) > 1 else ROOT + os.path.basename(args[0])
         ir.put_file(dest, open(args[0], "rb").read())
         print("put", dest)
+    elif what == "trim":
+        print(f"mark trim {int(args[0])} us (was {ir.set_trim(int(args[0]))})")
+    elif what == "get":
+        data = ir.get_file(args[0])
+        if len(args) > 1:
+            open(args[1], "wb").write(data)
+            print(f"{len(data)} bytes -> {args[1]}")
+        else:
+            sys.stdout.write(data.decode(errors="replace"))
     elif what == "shot":
         out = args[0] if args else "shot.png"
         ir.shot().save(out)
@@ -254,11 +288,14 @@ def main():
     elif what == "irusend":
         print(f"on air after {ir.iru_send(int(args[0]), bytes.fromhex(args[1]))} us")
     elif what == "takeover":
-        ir.takeover()
+        ir.takeover(kill="kill" in args, gpio="gpio" in args)
         print("taken over")
     elif what == "release":
-        ir.release()
-        print("released")
+        try:
+            ir.release()
+            print("released")
+        except (IrError, OSError):
+            print("connection dropped: rebooting (expected after takeover kill)")
     elif what == "regs":
         r = ir.regs()
         for k, v in r.items():
@@ -278,9 +315,15 @@ def main():
         print(f"baud {1152000 / (4 if 'pre4' in args else 1) / div:.0f}")
     elif what in ("tx", "txfill"):
         data = bytes.fromhex(args[0]) if what == "tx" else bytes([int(args[0], 0)]) * int(args[1], 0)
-        us, writes, empty = ir.tx(data)
-        print(f"{len(data)} bytes in {us} us ({len(data) * 10e6 / max(us, 1):.0f} bit/s on the wire),"
+        us, writes, empty, sent = ir.tx(data)
+        drained = not sent & 0x80000000
+        sent &= 0x7FFFFFFF
+        print(f"{sent} bytes in {us} us ({sent * 10e6 / max(us, 1):.0f} bit/s on the wire),"
               f" {writes} FIFO writes, FIFO found empty {empty}x")
+        if not drained:
+            print("NOT DRAINED: LSR never showed TX empty (transmitter disabled? EFCR bit 2)")
+        if sent < len(data):
+            print(f"STALLED: TXLVL stayed 0 for 2 s, {len(data) - sent} bytes not queued")
     elif what == "rx":
         polls, us, samples = ir.rx(int(args[0]))
         print(f"{polls} polls in {us} us ({us / max(polls, 1):.0f} us/poll), {len(samples)} with data,"

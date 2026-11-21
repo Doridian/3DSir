@@ -12,6 +12,14 @@ The clean carrier also works, but only with careful aiming. Its pulses are
 half as long, which gives about 6 dB less signal at 38 kHz. Range is limited
 by the IrDA LED either way.
 
+With a Flipper Zero right next to the port (`tools/flipper.py`), the clean
+carrier decodes for NEC, NECext, NEC42, Samsung32, RC5, RC6, SIRC/15/20 and
+Pioneer, once its marks are trimmed by 80 µs (they arrive ~80 µs long, the
+spaces as much short). At that range the dense carrier doesn't decode: the lone
+pulses in its spaces stretch marks by ~175 µs, ±90 µs depending on where an edge
+falls in its UART frame. So dense stays the default for TVs and clean gets the
+trim. RCA (56 kHz) can't be checked with a Flipper's 38 kHz receiver.
+
 Every press sends the signal N times (L/R, default 3), using a raw capture's
 trailing gap between copies. Denon receivers ignore a single frame.
 
@@ -24,6 +32,16 @@ trailing gap between copies. Denon receivers ignore a single frame.
   includes **36000** (value 7), **38400** (15), 48000 (6) and 57600 (14) baud.
 - In IrDA SIR mode, every `0` bit on the wire becomes a light pulse 3/16 of a
   bit long, and every `1` bit becomes darkness.
+- Measured with the chip taken over: the clock is right (divisors 12/24/48 give
+  95.5k/47.8k/24.0k bit/s), and I2C keeps the 64-byte TX FIFO from running dry
+  even at 96000 baud (a register read takes ~290 µs).
+- The bridge's GPIO0 is the transceiver's shutdown pin: high (as the `ir` module
+  leaves it when idle) nothing goes out or comes in. When idle the module also
+  leaves TX and RX disabled (EFCR = 0x06) and the FIFOs off.
+- Receiving works in IrDA mode: each burst of a remote's carrier arrives as one
+  `0x00` byte, so the gaps between bytes are the gaps between mark starts (a
+  Flipper's NEC: 13.6 ms leader, then 1.1 / 2.2 ms bits, decodable by hand).
+  Polling over I2C times them to about ±150 µs; mark widths aren't visible at 38400.
 
 ## The trick
 
@@ -70,8 +88,11 @@ protocols (NEC, Samsung, Sony, Kaseikyo) use 38400. 56 kHz (RCA) uses 57600.
 [3DS-Remote](https://github.com/RedTopper/3DS-Remote) recorded the bytes the
 UART received from a real remote and replayed them. The IrDA decoder throws
 away the carrier and the space timings, so a replay can't reproduce the
-signal. Learning codes from a remote is not realistically possible. This
-project generates signals from a code database instead.
+signal. This project generates signals from a code database instead.
+
+Timing the received bytes instead of replaying them could still learn
+pulse-distance codes (NEC, Samsung, ...), where every bit is in the time from
+one mark's start to the next. See "Receiving works" above.
 
 ## Pitfall: `IRU:WaitSendTransfer` cancels
 
@@ -140,12 +161,11 @@ SIRC20, RC5, RC5X, RC6, Kaseikyo, Pioneer, RCA, and raw.
 
 The debug build adds:
 
-- **[IR chip diagnostic]**: stops the system's `ir` module and talks to the SC16IS750 directly
-  over `i2c::IR`, the way Prox3DS takes over the NFC controller. It logs every register (the
+- **[IR chip diagnostic]**: closes `ir:u` and talks to the SC16IS750 directly over the `ir`
+  module's own `i2c::IR` session (see below). It logs every register (the
   divisor, IrDA mode, the bridge's own GPIO pins) and the I2C round-trip time. Then it counts
-  what the RX FIFO receives, so you can point a remote at the port. B gives the hardware back
-  and relaunches the `ir` module. ZL/ZR and the C-stick (served by the same module) don't work
-  while it's taken over.
+  what the RX FIFO receives, so you can point a remote at the port. B puts the chip back the
+  way the module left it and reopens `ir:u`.
 - A log in `sdmc:/3dsir.log`.
 - A TCP server on port 8020 while Wi-Fi is up. The address is shown on the top screen.
   `tools/irnet.py HOST ...` uses it to:
@@ -159,19 +179,39 @@ The debug build adds:
     TX FIFO (`tx`, `txfill`), record what the RX FIFO receives with timestamps (`rx`),
     time I2C (`bench`), and run raw GPIO, I2C and IPC commands (`gpio`, `i2c`, `ipc`).
 
-Still unverified on hardware: the I2C device ID (13, the 3dbrew number for bus 3 /
-0x9A), whether a register read works as a sub-address write followed by a separate read,
-and which `gpio:IR` bits do what.
+How the takeover works:
+
+- `i2c::IR` allows one session, and the `ir` module holds it. Luma3DS's
+  `svcControlService(SERVICEOP_STEAL_CLIENT_SESSION, ...)` (SVC 0xB0) gives us a second
+  handle to that same session. With `ir:u` closed the module is idle, and the takeover masks
+  the chip's interrupts so it stays that way.
+- The takeover saves the registers the module left. When idle it keeps the chip in sleep mode
+  (IER = 0x10), the transceiver shut down (bridge GPIO0, its SD pin, high), TX and RX
+  disabled (EFCR = 0x06) and the FIFOs off. Then it turns all of that on. Giving back
+  restores them, closes our handle (the module's stays open) and reopens `ir:u`. No reboot.
+- The old way, `takeover kill`, still exists. It doesn't work well: `ir` ignores PM's
+  terminate, `svcTerminateProcess` leaves it half dead (still listed, its `ir:u` hangs), and
+  relaunching it is impossible, so giving back then reboots the console.
+- Don't open `gpio:IR` (`takeover gpio`) after a kill: when that session closes, `gpio`
+  crashes with 0xD8E007F7. `gpio:IR` GetData (command 7, as on `gpio:NFC`) fails anyway
+  (0xE0E033EA).
+
+Verified: I2C device 13 is the bridge, and a register read is a sub-address write followed
+by a separate read.
+
+`tools/flipper.py` drives a Flipper Zero over USB as the other end: `rx SECONDS [raw]` prints
+what it receives (with `tools/irnet.py HOST code ...` from another shell), `tx PROTOCOL ADDR
+CMD` sends at the 3DS for `irnet.py rx`.
 
 Example session:
 
 ```
-tools/irnet.py 192.168.1.50 takeover
+tools/irnet.py 192.168.1.50 takeover           # shares ir's session; transceiver, TX/RX on
 tools/irnet.py 192.168.1.50 regs
-tools/irnet.py 192.168.1.50 uart 15 nrz        # 76800 baud, IrDA off
-tools/irnet.py 192.168.1.50 txfill 0x55 4000   # a 50% duty 38.4 kHz square wave?
-tools/irnet.py 192.168.1.50 rx 2000            # press a remote button at the port
-tools/irnet.py 192.168.1.50 release
+tools/irnet.py 192.168.1.50 uart 30 irda       # 38400 baud
+tools/irnet.py 192.168.1.50 txfill 0x00 4000   # ~1 s of 38.4 kHz carrier
+tools/irnet.py 192.168.1.50 rx 3000            # press a remote button at the port
+tools/irnet.py 192.168.1.50 release            # chip back as it was, ir:u reopened
 ```
 
 ## Host test
