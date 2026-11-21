@@ -81,6 +81,7 @@ static IrKey capture(const IrKey* k) {
     return got;
 }
 
+static size_t wrong_button; // true presses taken for another button (irdb_find_known_as)
 static double after[8];
 static size_t afterruns[8];
 
@@ -93,6 +94,7 @@ static Outcome find(const IrdbFile* t) {
         if(t->keys[i].button == irdb_button_id("Power")) k = &t->keys[i];
     if(!k) k = &t->keys[0];
     IrKey c0 = capture(k);
+    wrong_button += irdb_find_known_as(&c0, k->button) >= 0;
     if(!irdb_find_press(&c0, k->button)) return o;
     o.presses = 1;
     {
@@ -109,6 +111,7 @@ static Outcome find(const IrdbFile* t) {
             continue;
         }
         IrKey cb = capture(c);
+        wrong_button += irdb_find_known_as(&cb, b) >= 0;
         if(!irdb_find_press(&cb, b)) {
             irdb_find_skip(b);
             continue;
@@ -167,12 +170,20 @@ static void made_up(void) {
     // NECext 04FB/08F7 is NEC 04/08 on the air.
     IrKey k = {.proto = 1, .address = 4, .command = 8, .button = IRDB_BTN_OTHER};
     irdb_find_reset();
+    // Wrong buttons: Power's code when asked for Vol+ is Power; asked for Power it's right.
+    CHECK(irdb_find_known_as(&k, irdb_button_id("Vol+")) == irdb_button_id("Power"), "Power pressed for Vol+");
+    CHECK(irdb_find_known_as(&k, irdb_button_id("Power")) < 0, "Power pressed for Power");
     CHECK(irdb_find_press(&k, irdb_button_id("Power")), "power press");
     n = irdb_find_candidates(&cand);
     CHECK(n == 3, "3 candidates (library excluded), got %zu", n);
     int b = irdb_find_next();
     CHECK(b == irdb_button_id("Vol+"), "asks Vol+, got %s", irdb_button_label(b));
+    IrKey mute = {.proto = 1, .address = 4, .command = 9};
+    CHECK(irdb_find_known_as(&mute, b) == irdb_button_id("Mute"), "A's Mute pressed for Vol+");
+    IrKey unnamed = {.proto = 1, .address = 0x55, .command = 0x55};
+    CHECK(irdb_find_known_as(&unnamed, b) < 0, "a code nobody has isn't a wrong button");
     IrKey v = {.proto = 1, .address = 4, .command = 0x12};
+    CHECK(irdb_find_known_as(&v, b) < 0, "B's Vol+ pressed for Vol+");
     CHECK(irdb_find_press(&v, b), "vol+ press");
     n = irdb_find_candidates(&cand);
     CHECK(n == 1 && strstr(cand[0]->path, "/B.ir"), "B found (%zu left)", n);
@@ -277,6 +288,7 @@ static void real(const char* dir) {
     for(int i = 1; i < 8; i++) printf(" %d: %.1f", i, afterruns[i] ? after[i] / afterruns[i] : 0);
     printf("\n");
     CHECK(found == runs, "every remote found");
+    CHECK(!wrong_button, "%zu true presses taken for the wrong button", wrong_button);
     CHECK(!capture_misses, "%zu jittered captures decoded as something else", capture_misses);
 }
 

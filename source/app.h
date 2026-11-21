@@ -92,8 +92,10 @@ void toast(const char* fmt, ...) __attribute__((format(printf, 1, 2))); // a sho
 
 // Runs run() on a worker thread (hw_lock held), then done() on the UI thread. JOB_CANCEL: B sets
 // job_cancel. JOB_QUIET: a small "title..." note instead of the busy box (short sends). JOB_CPU: runs
-// below the UI thread (long computing jobs; the UI stays responsive).
-enum { JOB_CANCEL = 1, JOB_QUIET = 2, JOB_CPU = 4 };
+// below the UI thread (long computing jobs; the UI stays responsive). JOB_SCREEN: a job that runs under its
+// screen (listening for a remote): no busy box, the screen and its dialogs keep getting every button (B
+// too: the screen stops the job itself) and draw as usual.
+enum { JOB_CANCEL = 1, JOB_QUIET = 2, JOB_CPU = 4, JOB_SCREEN = 8 };
 void job_start(const char* title, void (*run)(void), void (*done)(void), u32 flags);
 bool job_busy(void);
 extern volatile bool job_cancel;

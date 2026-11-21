@@ -203,11 +203,14 @@ SIRC20, RC5, RC5X, RC6, Kaseikyo, Pioneer, RCA, and raw.
 
 ### Finding a remote
 
-**Find my remote** asks you to press Power on your remote (pointed at the IR port), then
-whichever button best tells the remaining candidates apart: Vol+, Mute, a digit, and so on.
-**X** skips a button your remote doesn't have, and **Y** shows the matches so far. A match
-opens like any remote, so you can try its buttons. **X** there saves a copy to the top of
-Remotes.
+**Find my remote** listens the whole time it's open: it asks you to press Power on your remote
+(pointed at the IR port), then right away whichever button best tells the remaining candidates
+apart: Vol+, Mute, a digit, and so on. Nothing to press on the 3DS in between. A press it can't
+decode, the button you pressed before, or a code the remotes left only have as another button
+("That's Vol+, not Power") gets a warning, and the same button is asked again. **X** (or the
+big button on the bottom screen) says your remote doesn't have the button, and **Y** shows the
+matches so far. When nothing more helps, the matches open by themselves. A match opens like any
+remote, so you can try its buttons. **X** there saves a copy to the top of Remotes.
 
 - It searches every `.ir` file in `sdmc:/3ds/3dsir`, and the Flipper-IRDB once
   **Remote database** has downloaded it. The download is the newest commit's tarball from GitHub
@@ -230,14 +233,16 @@ Remotes.
   `NECext 04FB/08F7` in one file, `NEC 04/08` in another, and a raw capture of either all
   match one press. Only codes the 3DS can learn can be matched: 7035 of the Flipper-IRDB's
   8901 files have at least one. RC5/RC6 remotes and air conditioners' long frames can't be.
-- The next button to ask is the one that leaves the fewest candidates on average. It is
-  only asked if that's at least 15% fewer. Past that point, what's left is mostly the same
+- The next button to ask is the one that leaves the fewest candidates on average, counting
+  the remotes without a button of that name that send the same code under another (a press
+  keeps them). It is only asked if that's at least 5% fewer. Past that point, what's left is mostly the same
   remote filed more than once. When you're asked for a named button, remotes whose button
   of that name sends a different code are dropped. Skipping a button drops the remotes that
   have it (a remote without Down isn't then asked for Up). Neither filter is applied if it
   would leave no remotes. Simulated on the whole Flipper-IRDB (`tests/irdb_test.c`, every press
-  decoded from jittered mark starts), every remote is found, after 2.75 presses on average. 97.5%
-  end with only remotes that send the same codes for every button you could press.
+  decoded from jittered mark starts), every remote is found, after 1.98 presses on average. 97%
+  end with only remotes that send the same codes for every button you could press, and no
+  correct press is ever taken for the wrong button.
 
 ### Suggested first test
 

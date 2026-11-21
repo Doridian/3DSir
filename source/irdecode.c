@@ -157,6 +157,6 @@ const char* ir_decode_hint(const uint32_t* t, size_t n) {
     if(shorts * 3 > n) return "The bursts come too close together for a supported code: probably a 36 kHz "
                               "(RC5 / RC6) remote, which the 3DS's IrDA receiver can't follow.";
     snprintf(s, sizeof(s), "%zu bursts, but not a code the 3DS can learn (NEC, Samsung, Sony, Kaseikyo, Pioneer, "
-             "RCA). Try again.", n);
+             "RCA).", n);
     return s;
 }
