@@ -72,13 +72,16 @@ CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lcitro2d -lcitro3d -lctru -lm
+# libcurl + mbedtls (the remote database download, CA bundle in data/), libarchive (unpacking it), from
+# devkitPro's 3ds portlibs.
+LIBS	:= -lcitro2d -lcitro3d -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -larchive -lz -lbz2 -llzma -llz4 -lzstd \
+		-lctru -lm
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
 # include and lib
 #---------------------------------------------------------------------------------
-LIBDIRS	:= $(CTRULIB)
+LIBDIRS	:= $(PORTLIBS) $(CTRULIB)
 
 
 #---------------------------------------------------------------------------------
@@ -237,6 +240,11 @@ $(OUTPUT).elf	:	$(OFILES)
 # you need a rule like this for each extension you use as binary data
 #---------------------------------------------------------------------------------
 %.bin.o	%_bin.h :	%.bin
+#---------------------------------------------------------------------------------
+	@echo $(notdir $<)
+	@$(bin2o)
+
+%.pem.o	%_pem.h :	%.pem
 #---------------------------------------------------------------------------------
 	@echo $(notdir $<)
 	@$(bin2o)

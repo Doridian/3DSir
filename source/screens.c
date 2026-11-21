@@ -3,12 +3,14 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
 #include "app.h"
+#include "irdb.h"
 #include "irdecode.h"
 #include "irhw.h"
 #include "log.h"
@@ -48,6 +50,9 @@ static bool file_exists(const char* path) {
 
 static IrFile remote; // the remote on screen
 static char remote_path[256]; // empty: the built-in codes (not saved)
+static bool remote_ro; // in the database's pack: X saves a copy instead of editing
+
+static void save_copy(const char* from); // into Remotes, under a name the user gives
 static UiList remote_list;
 
 static IrSignal send_sig;
@@ -216,8 +221,11 @@ static void learned_draw(void) {
 static const Screen learned_screen = {NULL, learned_input, learned_draw, NULL};
 
 static bool remote_save(void) {
-    if(!*remote_path) return true;
-    if(irfile_save(&remote, remote_path)) return true;
+    if(!*remote_path || remote_ro) return true;
+    if(irfile_save(&remote, remote_path)) {
+        irdb_touched(remote_path);
+        return true;
+    }
     msg_box("Couldn't save", "Writing %s failed. The SD card may be full or write-protected.", remote_path);
     return false;
 }
@@ -262,6 +270,7 @@ static void learned_remote_named(const char* name) {
         msg_box("Couldn't save", "Writing %s failed.", path);
         return;
     }
+    irdb_touched(path);
     open_remote(path);
 }
 
@@ -347,6 +356,8 @@ static void remote_input(u32 down, u32 repeat) {
     if(down & KEY_X) {
         if(!*remote_path) {
             toast("The built-in codes can't be edited");
+        } else if(remote_ro) {
+            save_copy(remote_path);
         } else if(!n) {
             act_learn_add();
         } else {
@@ -409,6 +420,7 @@ static void remote_draw(void) {
     }
     if(moving) ui_footer(BTN_UD " move   " BTN_A " done");
     else if(!*remote_path) ui_footer(BTN_A " send   " BTN_Y " send all with this name   " BTN_B " back");
+    else if(remote_ro) ui_footer(BTN_A " send   " BTN_X " save a copy   " BTN_Y " send all   " BTN_B " back");
     else ui_footer(BTN_A " send   " BTN_X " edit   " BTN_Y " send all   " BTN_B " back");
 }
 
@@ -419,7 +431,7 @@ static void remote_bottom(void) {
             if(ui_button_rep(4, 4, 154, 60, ui_col[COL_BAR], " Up")) app_press(KEY_UP);
             if(ui_button_rep(162, 4, 154, 60, ui_col[COL_BAR], " Down")) app_press(KEY_DOWN);
             if(ui_button(4, 70, 312, 40, ui_col[COL_SEL], "Done")) app_press(KEY_A);
-        } else if(*remote_path && ui_button(4, 4, 312, 60, ui_col[COL_SEL], "Learn a button")) {
+        } else if(*remote_path && !remote_ro && ui_button(4, 4, 312, 60, ui_col[COL_SEL], "Learn a button")) {
             app_press(KEY_X);
         }
         if(ui_button(4, UI_H - 34, 312, 30, ui_col[COL_PANEL], "Back")) app_press(KEY_B);
@@ -444,7 +456,7 @@ static void remote_bottom(void) {
         if(ui_button(68, y, 60, 30, ui_col[COL_PANEL], "")) remote_list.sel = (page + 1) % pages * per;
         ui_list_fix(&remote_list, remote.n, LIST_ROWS);
     }
-    if(*remote_path && ui_button(132, y, 90, 30, ui_col[COL_PANEL], "Edit")) app_press(KEY_X);
+    if(*remote_path && ui_button(132, y, 90, 30, ui_col[COL_PANEL], remote_ro ? "Save copy" : "Edit")) app_press(KEY_X);
     if(ui_button(226, y, 90, 30, ui_col[COL_PANEL], "Back")) app_press(KEY_B);
 }
 
@@ -452,13 +464,14 @@ static const Screen remote_screen = {NULL, remote_input, remote_draw, remote_bot
 
 static void open_remote(const char* path) {
     IrFile f;
-    if(!irfile_load(path, &f)) {
+    if(!irdb_load(path, &f)) {
         msg_box("Can't open", "%s", path);
         return;
     }
     irfile_free(&remote);
     remote = f;
     snprintf(remote_path, sizeof(remote_path), "%s", path);
+    remote_ro = irdb_is_packed(path);
     remote_list = (UiList){0};
     moving = false;
     logp("%s: %zu signals\n", base_name(path), remote.n);
@@ -489,9 +502,380 @@ static void open_builtin(void) {
         irfile_add(&remote, &s);
     }
     *remote_path = 0;
+    remote_ro = false;
     remote_list = (UiList){0};
     moving = false;
     app_screen(&remote_screen);
+}
+
+// ---------------------------------------------------------------- the remote database (irdb.c, irdbget.c)
+
+static struct {
+    char sha[48], err[160];
+    bool ok;
+} dbj;
+
+static void db_progress(size_t done, size_t todo) {
+    if(done % 8 == 0) job_note("Indexing remotes: %zu of %zu", done, todo);
+}
+
+static void db_refresh_run(void) {
+    job_note("Loading the remote index...");
+    dbj.ok = irdb_refresh(&job_cancel, db_progress);
+}
+
+static void db_rebuild_run(void) {
+    job_note("Indexing remotes...");
+    dbj.ok = irdb_rebuild(&job_cancel, db_progress);
+}
+
+static void db_check_run(void) {
+    *dbj.err = 0;
+    dbj.ok = irdb_latest(dbj.sha, sizeof(dbj.sha), dbj.err, sizeof(dbj.err));
+}
+
+static void db_install_run(void) {
+    *dbj.err = 0;
+    irdb_open();
+    dbj.ok = irdb_install(dbj.sha, &job_cancel, dbj.err, sizeof(dbj.err));
+    if(dbj.ok) dbj.ok = irdb_refresh(&job_cancel, db_progress); // the user's own remotes too
+}
+
+static void open_finder(void);
+
+static void db_install_done(void) {
+    if(!dbj.ok) {
+        msg_box("Flipper-IRDB", "%s", *dbj.err ? dbj.err : "Stopped. The remote index will be finished next time.");
+        return;
+    }
+    confirm("Flipper-IRDB", open_finder,
+            "Installed: %zu remotes the 3DS can recognize. Remotes > Flipper-IRDB lists them all.\n\nFind your "
+            "remote among them now?",
+            irdb_detectable());
+}
+
+static void db_install(void) {
+    job_start("Flipper-IRDB", db_install_run, db_install_done, JOB_CANCEL | JOB_CPU);
+}
+
+static void db_check_done(void) {
+    if(!dbj.ok) {
+        msg_box("Flipper-IRDB", "%s", dbj.err);
+        return;
+    }
+    char have[48];
+    irdb_pack_version(have, sizeof(have));
+    if(!strcmp(have, dbj.sha)) {
+        confirm("Flipper-IRDB", db_install, "The newest version (%.7s) is installed already.\n\nDownload it again?",
+                dbj.sha);
+        return;
+    }
+    confirm("Flipper-IRDB", db_install,
+            "%s version %.7s from GitHub: about 18 MB to download, ~9000 remotes (65 MB on the SD card). This "
+            "takes a few minutes.",
+            *have ? "Update to" : "Download", dbj.sha);
+}
+
+static void db_check(void) {
+    job_start("Flipper-IRDB", db_check_run, db_check_done, JOB_CANCEL | JOB_CPU);
+}
+
+static void db_rebuild_done(void) {
+    if(dbj.ok) toast("%zu remotes indexed", irdb_files());
+}
+
+static void db_rebuild(void) {
+    job_start("Remote index", db_rebuild_run, db_rebuild_done, JOB_CANCEL | JOB_CPU);
+}
+
+static void db_input(u32 down, u32 repeat) {
+    (void)repeat;
+    if(down & KEY_A) db_check();
+    if(down & KEY_Y) db_rebuild();
+    if(down & KEY_B) app_back();
+}
+
+static void db_draw(void) {
+    ui_header("Remote database", NULL);
+    char v[48], s[512];
+    irdb_pack_version(v, sizeof(v));
+    if(*v) snprintf(s, sizeof(s), "Flipper-IRDB version %.7s is installed.", v);
+    else snprintf(s, sizeof(s), "The Flipper-IRDB isn't installed.");
+    float y = ui_text_wrap(12, 30, UI_W - 24, S_BODY, ui_col[COL_TEXT], s);
+    if(irdb_loaded() && !job_busy()) { // a job may be changing the index
+        snprintf(s, sizeof(s), "%zu remote files indexed, %zu with codes the 3DS can recognize.", irdb_files(),
+                 irdb_detectable());
+        y = ui_text_wrap(12, y + 6, UI_W - 24, S_BODY, ui_col[COL_TEXT], s);
+    }
+    ui_text_wrap(12, y + 14, UI_W - 24, S_SMALL, ui_col[COL_DIM],
+                 "The Flipper-IRDB (github.com/Lucaslhm/Flipper-IRDB) collects thousands of remotes' codes. "
+                 "\"Find my remote\" looks for yours in it, and in every .ir file in " ROOT_DIR ". Remotes > "
+                 "Flipper-IRDB lists all of its remotes.\n\n"
+                 BTN_A " downloads it over Wi-Fi, or updates it to the newest version.\n" BTN_Y
+                 " indexes every remote again (after copying or changing .ir files on a PC).");
+    ui_footer(BTN_A " download / update   " BTN_Y " re-index   " BTN_B " back");
+}
+
+static const Screen db_screen = {NULL, db_input, db_draw, NULL};
+
+static void open_db(void) {
+    app_screen(&db_screen);
+}
+
+// ---------------------------------------------------------------- find my remote
+
+#define HIST 6
+
+static struct {
+    int ask; // the button asked for (IRDB_BTN_OTHER: any)
+    char hist[HIST][96]; // what each press found
+    int nhist;
+    u32 t[512];
+    size_t n;
+    Result rc;
+    UiList l; // the matches
+} fnd;
+
+static const Screen finder_screen, matches_screen;
+
+static void hist_add(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void hist_add(const char* fmt, ...) {
+    if(fnd.nhist == HIST) memmove(fnd.hist[0], fnd.hist[1], sizeof(fnd.hist[0]) * (HIST - 1)), fnd.nhist--;
+    va_list va;
+    va_start(va, fmt);
+    vsnprintf(fnd.hist[fnd.nhist++], sizeof(fnd.hist[0]), fmt, va);
+    va_end(va);
+}
+
+static size_t finder_left(void) {
+    const IrdbFile* const* c;
+    return irdb_find_candidates(&c);
+}
+
+static void show_matches(void) {
+    fnd.l = (UiList){0};
+    if(app_top() != &matches_screen) app_screen(&matches_screen);
+}
+
+// After a press or a skip: the next question, or the answer.
+static void finder_next(void) {
+    if(!irdb_find_presses()) return; // still the first press: Power, or any
+    int b = irdb_find_next();
+    if(b < 0 || finder_left() < 2) {
+        fnd.ask = IRDB_BTN_OTHER; // back from the matches, any press narrows them further
+        show_matches();
+        return;
+    }
+    fnd.ask = b;
+}
+
+static void listen_run(void) {
+    fnd.n = 0;
+    fnd.rc = app_hw_direct(IRHW_STEAL);
+    if(R_SUCCEEDED(fnd.rc)) fnd.n = app_learn_capture(fnd.t, sizeof(fnd.t) / sizeof(fnd.t[0]), &job_cancel);
+    app_hw_iru();
+}
+
+static void listen_start(void);
+
+static void learn_instead(void) {
+    learn.target = LEARN_NEW_REMOTE;
+    snprintf(learn.dir, sizeof(learn.dir), "%s", ROOT_DIR);
+    app_screen(&learned_screen);
+}
+
+static void listen_done(void) {
+    if(job_cancel) return;
+    if(R_FAILED(fnd.rc)) {
+        msg_box("Find my remote", "Couldn't take the IR receiver over (%08lX). This needs Luma3DS.", fnd.rc);
+        return;
+    }
+    IrDecoded d;
+    IrKey k;
+    if(!ir_decode(fnd.t, fnd.n, &d) || !irdb_decoded_key(&d, &k)) {
+        confirm("Not recognized", listen_start, "%s\n\nTry again?", ir_decode_hint(fnd.t, fnd.n));
+        return;
+    }
+    const char* what = irdb_button_label(fnd.ask);
+    logp("find: %s -> %s %02lX / %02lX\n", what, d.protocol, d.address, d.command);
+    size_t before = irdb_find_presses() ? finder_left() : irdb_detectable();
+    if(!irdb_find_press(&k, fnd.ask)) {
+        if(!irdb_find_presses()) {
+            // Nothing sends it: offer to learn the remote button by button, starting with this one.
+            learn.d = d;
+            learn.n = fnd.n;
+            memset(&learn.sig, 0, sizeof(learn.sig));
+            snprintf(learn.sig.protocol, sizeof(learn.sig.protocol), "%s", d.protocol);
+            learn.sig.address = d.address;
+            learn.sig.command = d.command;
+            confirm("Not in the database", learn_instead,
+                    "No remote in the database sends %s %02lX / %02lX.\n\nLearn your remote button by button instead, "
+                    "starting with this one?",
+                    d.protocol, d.address, d.command);
+            return;
+        }
+        hist_add("%s: %s %02lX/%02lX, none of the %zu sends it", what, d.protocol, d.address, d.command, before);
+        toast("None of the matching remotes sends that code");
+        finder_next();
+        return;
+    }
+    hist_add("%s: %s %02lX/%02lX, %zu remote%s left", what, d.protocol, d.address, d.command, finder_left(),
+             finder_left() == 1 ? "" : "s");
+    finder_next();
+}
+
+static void listen_start(void) {
+    job_start("Listening", listen_run, listen_done, JOB_CANCEL);
+    job_note("Point the remote at the IR port on the back of the 3DS, a few cm away, and press %s once.",
+             fnd.ask == IRDB_BTN_OTHER ? "any button" : irdb_button_label(fnd.ask));
+}
+
+static void finder_input(u32 down, u32 repeat) {
+    (void)repeat;
+    if(down & KEY_A) listen_start();
+    if(down & KEY_X) { // the remote has no such button
+        if(fnd.ask == IRDB_BTN_OTHER) return;
+        irdb_find_skip(fnd.ask);
+        if(irdb_find_presses())
+            hist_add("%s: skipped, %zu remote%s left", irdb_button_label(fnd.ask), finder_left(),
+                     finder_left() == 1 ? "" : "s");
+        else
+            hist_add("%s: skipped", irdb_button_label(fnd.ask));
+        if(!irdb_find_presses()) fnd.ask = IRDB_BTN_OTHER;
+        else finder_next();
+    }
+    if((down & KEY_Y) && irdb_find_presses()) show_matches();
+    if(down & KEY_B) app_back();
+}
+
+static void finder_draw(void) {
+    char right[48], s[256];
+    size_t left = irdb_find_presses() ? finder_left() : irdb_detectable();
+    snprintf(right, sizeof(right), "%zu remote%s", left, left == 1 ? "" : "s");
+    ui_header("Find my remote", right);
+    if(fnd.ask == IRDB_BTN_OTHER)
+        snprintf(s, sizeof(s), "Press " BTN_A ", then press any button on your remote.");
+    else
+        snprintf(s, sizeof(s), "Press " BTN_A ", then press %s on your remote.", irdb_button_label(fnd.ask));
+    ui_text_wrap(12, 32, UI_W - 24, S_BODY, ui_col[COL_ACCENT], s);
+    float y = 62;
+    if(!irdb_find_presses() && !fnd.nhist) {
+        ui_text_wrap(12, y, UI_W - 24, S_SMALL, ui_col[COL_TEXT],
+                     "A few presses pick your remote out of the database: each button asked for is the one that tells "
+                     "the remaining remotes apart best.\n\nHold the remote a few cm from the IR port on the back of "
+                     "the 3DS. Remotes with 36 kHz codes (RC5 / RC6, most Philips) can't be recognized.");
+    }
+    for(int i = 0; i < fnd.nhist; i++, y += SMALL_H + 2) ui_text(12, y, S_SMALL, ui_col[COL_DIM], "%s", fnd.hist[i]);
+    if(irdb_find_presses())
+        ui_footer(BTN_A " listen   " BTN_X " don't have it   " BTN_Y " matches   " BTN_B " back");
+    else if(fnd.ask != IRDB_BTN_OTHER)
+        ui_footer(BTN_A " listen   " BTN_X " no such button   " BTN_B " back");
+    else
+        ui_footer(BTN_A " listen   " BTN_B " back");
+}
+
+static const Screen finder_screen = {NULL, finder_input, finder_draw, NULL};
+
+// "irdb:/TVs/LG/LG_TV.ir" -> "TVs/LG/LG_TV", "sdmc:/3ds/3dsir/TVs/Mine.ir" -> "TVs/Mine"
+static void db_name(const char* path, char* out, size_t max) {
+    const char* p = path;
+    if(!strncmp(p, ROOT_DIR "/", strlen(ROOT_DIR) + 1)) p += strlen(ROOT_DIR) + 1;
+    else if(irdb_is_packed(p)) p += strlen(IRDB_PACKED) + 1;
+    snprintf(out, max, "%s", p);
+    size_t n = strlen(out);
+    if(n > 3 && !strcasecmp(out + n - 3, ".ir")) out[n - 3] = 0;
+}
+
+static char copy_from[512];
+
+static void copy_named(const char* name) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s.ir", ROOT_DIR, name);
+    if(bad_file_name(name) || file_exists(path)) {
+        toast(bad_file_name(name) ? "Not a usable file name" : "%s.ir exists already", name);
+        entry_text("Save a copy", "The copy's name in Remotes (its file is <name>.ir).", name, 60, copy_named);
+        return;
+    }
+    IrFile f;
+    if(!irdb_load(copy_from, &f)) {
+        msg_box("Can't open", "%s", copy_from);
+        return;
+    }
+    bool ok = irfile_save(&f, path);
+    irfile_free(&f);
+    if(!ok) {
+        msg_box("Couldn't save", "Writing %s failed.", path);
+        return;
+    }
+    irdb_touched(path);
+    open_remote(path);
+}
+
+static void save_copy(const char* from) {
+    snprintf(copy_from, sizeof(copy_from), "%s", from);
+    char name[64];
+    remote_name(copy_from, name, sizeof(name));
+    entry_text("Save a copy", "The copy's name in Remotes (its file is <name>.ir).", name, 60, copy_named);
+}
+
+static void matches_input(u32 down, u32 repeat) {
+    const IrdbFile* const* c;
+    size_t n = irdb_find_candidates(&c);
+    ui_list_nav(&fnd.l, n, LIST_ROWS - 2, repeat);
+    if(down & KEY_B) {
+        app_back();
+        return;
+    }
+    if(!n) return;
+    if(down & KEY_A) open_remote(c[fnd.l.sel]->path);
+    if(down & KEY_X) save_copy(c[fnd.l.sel]->path);
+}
+
+static void matches_draw(void) {
+    const IrdbFile* const* c;
+    size_t n = irdb_find_candidates(&c);
+    char right[32];
+    snprintf(right, sizeof(right), "%zu match%s", n, n == 1 ? "" : "es");
+    ui_header("Find my remote", right);
+    ui_text_wrap(12, LIST_Y, UI_W - 24, S_SMALL, ui_col[COL_DIM],
+                 n > 1 ? "These send every code you pressed, best first. Open one to try its buttons."
+                       : "This one sends every code you pressed. Open it to try its buttons.");
+    float top = LIST_Y + 2 * SMALL_H + 4;
+    for(int i = fnd.l.top; i < (int)n && i < fnd.l.top + LIST_ROWS - 2; i++) {
+        float y = top + (i - fnd.l.top) * LINE_H;
+        bool sel = i == fnd.l.sel;
+        if(sel) ui_sel(4, y - 1, UI_W - 8, LINE_H);
+        char name[256];
+        db_name(c[i]->path, name, sizeof(name));
+        ui_text_right(UI_W - 12, y, S_SMALL, ui_col[COL_DIM], "%u buttons", c[i]->buttons);
+        ui_text(12, y, S_BODY, ui_col[sel ? COL_TEXT : COL_DIM], "%s", ui_fit(name, UI_W - 100, S_BODY));
+    }
+    ui_footer(BTN_A " open   " BTN_X " save a copy to Remotes   " BTN_B " back");
+}
+
+static const Screen matches_screen = {NULL, matches_input, matches_draw, NULL};
+
+static void finder_begin(void) {
+    irdb_find_reset();
+    memset(&fnd, 0, sizeof(fnd));
+    fnd.ask = irdb_button_id("Power");
+    app_screen(&finder_screen);
+}
+
+static void finder_loaded(void) {
+    if(!dbj.ok) return; // stopped while indexing
+    if(irdb_detectable()) {
+        finder_begin();
+        return;
+    }
+    confirm("Find my remote", db_check,
+            "There are no remotes to compare with yet. Download the Flipper-IRDB (about 18 MB, ~9000 remotes) "
+            "over Wi-Fi?");
+}
+
+static void open_finder(void) {
+    mkdir(ROOT_DIR, 0777);
+    job_start("Find my remote", db_refresh_run, finder_loaded, JOB_CANCEL | JOB_CPU);
 }
 
 // ---------------------------------------------------------------- the browser
@@ -507,12 +891,50 @@ static int cmp_str(const void* a, const void* b) {
     return strcasecmp(*(char* const*)a, *(char* const*)b);
 }
 
+// The downloaded database, a folder in Remotes that is really the pack (irdb.h): its path is IRDB_PACKED.
+#define VIRT_NAME "Flipper-IRDB/"
+
+static bool br_virtual(void) {
+    return !strncmp(br.path, IRDB_PACKED, strlen(IRDB_PACKED));
+}
+
+static void br_name_add(int* cap, const char* name) {
+    if(br.n == *cap) br.names = realloc(br.names, (*cap = *cap ? *cap * 2 : 32) * sizeof(char*));
+    br.names[br.n++] = strdup(name);
+}
+
+// A folder of the pack: the index's paths under it, a level deep.
+static void br_scan_virtual(int* cap) {
+    char prefix[300], last[256] = "";
+    snprintf(prefix, sizeof(prefix), "%s/", br.path);
+    size_t pl = strlen(prefix);
+    for(size_t i = 0; i < irdb_files(); i++) {
+        const char* p = irdb_file(i)->path;
+        if(strncmp(p, prefix, pl)) continue;
+        p += pl;
+        const char* slash = strchr(p, '/');
+        char name[256];
+        if(slash) snprintf(name, sizeof(name), "%.*s/", (int)(slash - p), p);
+        else snprintf(name, sizeof(name), "%s", p);
+        if(slash && !strcmp(name, last)) continue; // the folder's other files
+        if(slash) snprintf(last, sizeof(last), "%s", name);
+        br_name_add(cap, name);
+    }
+}
+
 static void br_scan(void) {
     for(int i = 0; i < br.n; i++) free(br.names[i]);
     free(br.names);
     br.names = NULL;
     br.n = 0;
     int cap = 0;
+    if(br_virtual()) {
+        br_scan_virtual(&cap);
+        qsort(br.names, br.n, sizeof(char*), cmp_str);
+        ui_list_fix(&br.l, br.n, LIST_ROWS);
+        return;
+    }
+    if(!strcmp(br.path, ROOT_DIR) && file_exists(IRDB_PACK)) br_name_add(&cap, VIRT_NAME);
     DIR* d = opendir(br.path);
     struct dirent* e;
     while(d && (e = readdir(d))) {
@@ -520,9 +942,10 @@ static void br_scan(void) {
         bool dir = e->d_type == DT_DIR;
         size_t len = strlen(e->d_name);
         if(!dir && (len < 3 || strcasecmp(e->d_name + len - 3, ".ir"))) continue;
-        if(br.n == cap) br.names = realloc(br.names, (cap = cap ? cap * 2 : 32) * sizeof(char*));
-        br.names[br.n] = malloc(len + 2);
-        sprintf(br.names[br.n++], "%s%s", e->d_name, dir ? "/" : "");
+        char name[260];
+        snprintf(name, sizeof(name), "%s%s", e->d_name, dir ? "/" : "");
+        if(!strcmp(br.path, ROOT_DIR) && !strcmp(name, VIRT_NAME)) continue; // a real one is hidden by the pack
+        br_name_add(&cap, name);
     }
     if(d) closedir(d);
     qsort(br.names, br.n, sizeof(char*), cmp_str);
@@ -537,6 +960,17 @@ static void br_sel_path(char* out, size_t max) {
     snprintf(out, max, "%.255s/%s", br.path, br.names[br.l.sel]);
     size_t n = strlen(out);
     if(out[n - 1] == '/') out[n - 1] = 0;
+}
+
+// Into the pack's folder: the index lists it, and is loaded first if it isn't.
+static void br_enter_virtual(void) {
+    snprintf(br.path, sizeof(br.path), "%s", IRDB_PACKED);
+    br.l = (UiList){0};
+    br_scan();
+}
+
+static void br_virtual_loaded(void) {
+    if(dbj.ok) br_enter_virtual();
 }
 
 static bool br_sel_dir(void) {
@@ -555,6 +989,8 @@ static void br_renamed(const char* name) {
     } else if(rename(from, to)) {
         msg_box("Rename", "Renaming failed (%d).", errno);
     } else {
+        irdb_touched(from);
+        irdb_touched(to);
         toast("Renamed");
     }
     br_scan();
@@ -569,8 +1005,12 @@ static void br_rename(void) {
 static void br_delete_yes(void) {
     char path[512];
     br_sel_path(path, sizeof(path));
-    if(remove(path)) msg_box("Delete", "Deleting failed (%d).", errno);
-    else toast("Deleted");
+    if(remove(path)) {
+        msg_box("Delete", "Deleting failed (%d).", errno);
+    } else {
+        irdb_touched(path);
+        toast("Deleted");
+    }
     br_scan();
 }
 
@@ -593,6 +1033,7 @@ static void br_created(const char* name) {
         msg_box("Couldn't save", "Writing %s failed.", path);
         return;
     }
+    irdb_touched(path);
     open_remote(path);
 }
 
@@ -611,6 +1052,14 @@ static void br_input(u32 down, u32 repeat) {
             app_back();
             return;
         }
+        if(!strcmp(br.path, IRDB_PACKED)) { // out of the pack, onto it
+            snprintf(br.path, sizeof(br.path), "%s", ROOT_DIR);
+            br_scan();
+            for(int i = 0; i < br.n; i++)
+                if(!strcmp(br.names[i], VIRT_NAME)) br.l.sel = i;
+            ui_list_fix(&br.l, br.n, LIST_ROWS);
+            return;
+        }
         // up a folder, the cursor on the one we came from
         char from[260];
         snprintf(from, sizeof(from), "%s/", base_name(br.path));
@@ -621,7 +1070,7 @@ static void br_input(u32 down, u32 repeat) {
         ui_list_fix(&br.l, br.n, LIST_ROWS);
         return;
     }
-    if(down & KEY_Y) {
+    if((down & KEY_Y) && !br_virtual()) {
         static const MenuItem items[] = {{"Learn its first button", br_new_learn}, {"Empty remote", br_new_empty}};
         popup("New remote", items, 2);
     }
@@ -629,7 +1078,10 @@ static void br_input(u32 down, u32 repeat) {
     if(down & KEY_A) {
         char path[512];
         br_sel_path(path, sizeof(path));
-        if(br_sel_dir()) {
+        if(!strcmp(br.path, ROOT_DIR) && !strcmp(br.names[br.l.sel], VIRT_NAME)) {
+            if(irdb_loaded()) br_enter_virtual();
+            else job_start("Flipper-IRDB", db_refresh_run, br_virtual_loaded, JOB_CANCEL | JOB_CPU);
+        } else if(br_sel_dir()) {
             snprintf(br.path, sizeof(br.path), "%.255s", path);
             br.l = (UiList){0};
             br_scan();
@@ -637,7 +1089,11 @@ static void br_input(u32 down, u32 repeat) {
             open_remote(path);
         }
     }
-    if((down & KEY_X) && !br_sel_dir()) {
+    if((down & KEY_X) && br_virtual() && !br_sel_dir()) {
+        char path[512];
+        br_sel_path(path, sizeof(path));
+        save_copy(path);
+    } else if((down & KEY_X) && !br_sel_dir()) {
         static const MenuItem items[] = {{"Rename", br_rename}, {"Delete", br_delete}};
         char name[64];
         remote_name(br.names[br.l.sel], name, sizeof(name));
@@ -647,7 +1103,8 @@ static void br_input(u32 down, u32 repeat) {
 
 static void br_draw(void) {
     char title[288], right[32];
-    snprintf(title, sizeof(title), "Remotes%s", br.path + strlen(ROOT_DIR));
+    if(br_virtual()) snprintf(title, sizeof(title), "Remotes/Flipper-IRDB%s", br.path + strlen(IRDB_PACKED));
+    else snprintf(title, sizeof(title), "Remotes%s", br.path + strlen(ROOT_DIR));
     snprintf(right, sizeof(right), "%d item%s", br.n, br.n == 1 ? "" : "s");
     ui_header(title, right);
     if(!br.n)
@@ -663,7 +1120,8 @@ static void br_draw(void) {
         else remote_name(br.names[i], name, sizeof(name));
         ui_text(12, y, S_BODY, ui_col[dir ? COL_ACCENT : sel ? COL_TEXT : COL_DIM], "%s", ui_fit(name, UI_W - 30, S_BODY));
     }
-    ui_footer(BTN_A " open   " BTN_X " edit   " BTN_Y " new remote   " BTN_B " back");
+    if(br_virtual()) ui_footer(BTN_A " open   " BTN_X " save a copy   " BTN_B " back");
+    else ui_footer(BTN_A " open   " BTN_X " edit   " BTN_Y " new remote   " BTN_B " back");
 }
 
 static const Screen browser_screen = {br_show, br_input, br_draw, NULL};
@@ -841,11 +1299,16 @@ static void root_learn(void) {
 static const MenuEntry root_entries[] = {
     {"Remotes", "Your remotes: Flipper Zero .ir files in " ROOT_DIR " (folders work, so the whole Flipper-IRDB can go "
                 "there). Open one to send its buttons, or learn, rename, move and delete them.", open_browser},
+    {"Find my remote", "Press a few buttons on your remote, as asked, and 3DSir finds it among the Flipper-IRDB's "
+                       "thousands of remotes (and your own .ir files), with all its buttons.\n\nThe first time, it "
+                       "offers to download the Flipper-IRDB over Wi-Fi.", open_finder},
     {"Learn new remote", "Point a remote at the IR port on the back of the 3DS and press a button: it becomes the "
                          "first button of a new remote.\n\nLearns NEC, Samsung, Sony, Kaseikyo (Panasonic), Pioneer and "
                          "RCA codes. RC5 / RC6 (Philips) can't be learned.", root_learn},
     {"Built-in test codes", "Power and Vol+ for Samsung, LG, Sony and Philips TVs, to check the 3DS reaches your TV.",
      open_builtin},
+    {"Remote database", "Download or update the Flipper-IRDB over Wi-Fi, or index the remotes on the SD card again.",
+     open_db},
     {"Settings", "The carrier style (dense: strongest, clean: what a Flipper decodes) and how many times each press "
                  "sends its code.", open_settings},
     {"Tools", "Carrier test, bit rate check, the log.", open_tools},
@@ -859,7 +1322,7 @@ static void root_input(u32 down, u32 repeat) {
 
 static void root_draw(void) {
     menu_draw(&root_menu);
-    if(!iru_is_open()) ui_text(12, 176, S_SMALL, ui_col[COL_ERR], "ir:u is unavailable: nothing can be sent.");
+    if(!iru_is_open()) ui_text(12, 196, S_SMALL, ui_col[COL_ERR], "ir:u is unavailable: nothing can be sent.");
 }
 
 static const Screen root_screen = {NULL, root_input, root_draw, NULL};

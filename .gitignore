@@ -8,3 +8,4 @@ __pycache__/
 *.cia
 host_test
 decode_test
+irdb_test

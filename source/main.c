@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 
 #include "app.h"
+#include "irdb.h"
 #include "log.h"
 
 #define LOG_PATH "sdmc:/3dsir.log" // debug build only
@@ -78,6 +79,7 @@ int main(int argc, char* argv[]) {
     net_start();
 #endif
     mkdir(ROOT_DIR, 0777);
+    irdb_init(ROOT_DIR, IRDB_CACHE, IRDB_PACK);
     settings_load();
     if(R_FAILED(iru_open())) logp("ir:u unavailable\n");
 

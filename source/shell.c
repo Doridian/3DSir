@@ -173,8 +173,11 @@ void job_start(const char* title, void (*run)(void), void (*done)(void), u32 fla
     busy = true;
     if(!(flags & JOB_QUIET)) logp("--- %s ---\n", title);
     // Above the UI thread: learning times the IR receiver's bytes by polling, and the UI only gets in
-    // between while the worker waits on I2C anyway.
-    worker = threadCreate(job_thread, NULL, 0x8000, 0x28, -2, false);
+    // between while the worker waits on I2C anyway. JOB_CPU jobs (downloading, indexing) go below it instead,
+    // or the screen would freeze for minutes. 128 KB of stack for TLS (mbedtls) and libarchive.
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    worker = threadCreate(job_thread, NULL, 0x20000, flags & JOB_CPU ? prio + 1 : 0x28, -2, false);
     if(!worker) {
         busy = false;
         msg_box("Error", "Could not start the worker thread.");

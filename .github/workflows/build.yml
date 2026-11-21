@@ -51,7 +51,8 @@ jobs:
             3dsir-release.cia
 
   # The encoder on the host (tests/host_test.c): every protocol rendered, run through a simulated IrDA
-  # encoder and receiver, and checked against known on-air codes.
+  # encoder and receiver, and checked against known on-air codes. Then the learning decoder
+  # (tests/decode_test.c) and the remote finder (tests/irdb_test.c).
   host-test:
     runs-on: ubuntu-latest
     steps:
@@ -60,6 +61,14 @@ jobs:
         run: cc -O2 -Wall -Isource tests/host_test.c source/irenc.c source/irfile.c -o host_test
       - name: Run
         run: ./host_test
+      - name: Build the decoder and finder tests
+        run: |
+          cc -O2 -Wall -Isource tests/decode_test.c source/irdecode.c source/irenc.c -o decode_test
+          cc -O2 -Wall -Isource tests/irdb_test.c source/irdb.c source/irdecode.c source/irenc.c source/irfile.c -o irdb_test
+      - name: Run the decoder and finder tests
+        run: |
+          ./decode_test
+          ./irdb_test
 
   # A v* tag: both builds and the release CIA as a GitHub release.
   release:
