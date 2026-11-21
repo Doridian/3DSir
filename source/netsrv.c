@@ -53,8 +53,10 @@ enum {
     OP_SET_TRIM = 0x10, // trim s32: ir_mark_trim_us for every later send, either style (by default
                         // clean gets 80, dense 0) -> the old value s32
     // UI debugging, served without hw_lock:
-    OP_SHOT = 0x20, // offset u32 -> up to OUT_MAX bytes of the top framebuffer (240x400, the screen's format: RGB565 under the console)
+    OP_SHOT = 0x20, // offset u32 [, screen u8: 1 = bottom] -> up to OUT_MAX bytes of the framebuffer (240x400 or
+                    // 240x320 BGR8, column-major from the bottom left), empty past the end
     OP_KEYS = 0x21, // keys u32 (KEY_*) -> pressed for one frame of the UI
+    OP_TOUCH = 0x22, // x u16, y u16 -> a tap on the bottom screen, for one frame of the UI
     OP_LOG = 0x24, // lines u32 -> the last that many log lines, '\n' each
     OP_GET_FILE = 0x25, // offset u32, path (any sdmc:/ file) -> up to OUT_MAX bytes from there
 };
@@ -63,6 +65,7 @@ enum {
 
 char net_addr[32];
 volatile u32 net_keys;
+volatile u32 net_touch;
 
 static u32* soc_buf;
 static int listen_fd = -1;
@@ -127,6 +130,10 @@ static Result handle_debug(u8 op, const u8* in, u32 in_len, u8* out, u16* out_le
         __atomic_or_fetch(&net_keys, v, __ATOMIC_SEQ_CST);
         return 0;
     }
+    if(op == OP_TOUCH) {
+        __atomic_store_n(&net_touch, 0x80000000u | (v & 0x7FFF7FFF), __ATOMIC_SEQ_CST);
+        return 0;
+    }
     if(op == OP_LOG) {
         int n = log_count(), i = n - (int)v < 0 ? 0 : n - (int)v;
         char line[128];
@@ -141,8 +148,9 @@ static Result handle_debug(u8 op, const u8* in, u32 in_len, u8* out, u16* out_le
         return 0;
     }
     u16 w, h;
-    u8* fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &w, &h);
-    u32 size = w * h * gspGetBytesPerPixel(gfxGetScreenFormat(GFX_TOP));
+    gfxScreen_t scr = in_len > 4 && in[4] == 1 ? GFX_BOTTOM : GFX_TOP;
+    u8* fb = gfxGetFramebuffer(scr, GFX_LEFT, &w, &h);
+    u32 size = w * h * gspGetBytesPerPixel(gfxGetScreenFormat(scr));
     if(v < size) {
         *out_len = size - v < OUT_MAX ? size - v : OUT_MAX;
         GSPGPU_InvalidateDataCache(fb + v, *out_len);
@@ -399,7 +407,7 @@ static void serve_client(int fd, u8* in, u8* out) {
         u16 out_len = 0;
         Result res;
         u8 op = hdr[0];
-        if(op == OP_SHOT || op == OP_KEYS || op == OP_LOG || op == OP_GET_FILE) {
+        if(op == OP_SHOT || op == OP_KEYS || op == OP_TOUCH || op == OP_LOG || op == OP_GET_FILE) {
             res = handle_debug(op, in, len, out, &out_len);
         } else if(op == OP_SET_TRIM) {
             put32(out, (u32)ir_mark_trim_us);

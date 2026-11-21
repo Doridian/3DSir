@@ -4,10 +4,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#define RING_LINES 256
+#define RING_LINES 1024
 #define LINE_MAX 128
 
-static PrintConsole* con;
 static FILE* file;
 static LightLock lock;
 static char ring[RING_LINES][LINE_MAX];
@@ -15,9 +14,8 @@ static int ring_head, ring_n; // next slot to fill, lines kept
 static char partial[LINE_MAX]; // the current line until its '\n'
 static size_t partial_len;
 
-void log_init(PrintConsole* console, const char* file_path) {
+void log_init(const char* file_path) {
     LightLock_Init(&lock);
-    con = console;
     if(file_path) file = fopen(file_path, "a");
 }
 
@@ -40,13 +38,6 @@ void logp(const char* fmt, ...) {
     va_start(va, fmt);
     vsnprintf(s, sizeof(s), fmt, va);
     va_end(va);
-
-    // The console isn't thread safe: only the main thread (no libctru Thread) prints there.
-    if(con && !threadGetCurrent()) {
-        PrintConsole* prev = consoleSelect(con);
-        fputs(s, stdout);
-        consoleSelect(prev);
-    }
 
     // The ring and the file get the text without its ANSI color codes.
     char plain[512];
@@ -77,12 +68,17 @@ void logp(const char* fmt, ...) {
 }
 
 int log_count(void) {
-    return ring_n;
+    LightLock_Lock(&lock);
+    int n = ring_n + (partial_len > 0); // the line being written counts once it has text
+    LightLock_Unlock(&lock);
+    return n;
 }
 
 void log_line(int i, char* out, size_t max) {
     LightLock_Lock(&lock);
-    if(i < 0 || i >= ring_n) {
+    if(i == ring_n && partial_len) {
+        snprintf(out, max, "%.*s", (int)partial_len, partial);
+    } else if(i < 0 || i >= ring_n) {
         out[0] = 0;
     } else {
         int idx = (ring_head - ring_n + i + RING_LINES) % RING_LINES;

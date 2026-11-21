@@ -1,6 +1,7 @@
 # 3DSir
 
-An experiment to turn the 3DS infrared port into a universal TV remote.
+Turns the 3DS infrared port into a universal TV remote that reads, edits and learns Flipper Zero `.ir`
+files.
 
 ## Status
 
@@ -22,6 +23,10 @@ trim. RCA (56 kHz) can't be checked with a Flipper's 38 kHz receiver.
 
 Every press sends the signal N times (L/R, default 3), using a raw capture's
 trailing gap between copies. Denon receivers ignore a single frame.
+
+Learning works for pulse-distance codes: NEC, NECext, NEC42(ext), Samsung32,
+SIRC/15/20, Kaseikyo, Pioneer and RCA, tested with a Flipper Zero sending at
+the port. RC5 and RC6 can't be learned (see "Learning" below).
 
 ## The hardware
 
@@ -90,9 +95,35 @@ UART received from a real remote and replayed them. The IrDA decoder throws
 away the carrier and the space timings, so a replay can't reproduce the
 signal. This project generates signals from a code database instead.
 
-Timing the received bytes instead of replaying them could still learn
-pulse-distance codes (NEC, Samsung, ...), where every bit is in the time from
-one mark's start to the next. See "Receiving works" above.
+Timing the received bytes instead of replaying them does learn pulse-distance
+codes (NEC, Samsung, ...), where every bit is in the time from one mark's start
+to the next. See "Learning" below.
+
+## Learning
+
+Learning takes the SC16IS750 over (as the debug build's diagnostic does, see
+below), sets 38400 baud IrDA, and polls RXLVL over I2C (~290 µs a poll). Each
+burst of a 38/40 kHz carrier arrives as one byte, so the capture is the list of
+times the marks start. Measured with a Flipper Zero:
+
+- Mark starts are late by up to about a poll, a few by ~400 µs: an interval can be
+  off by ±350 µs. That's close to the 600 µs between SIRC's 0 and 1, and more than
+  half of Kaseikyo's 864 µs bit.
+- So `irdecode.c` doesn't classify intervals alone. It predicts each mark's start
+  from a reference that absorbs half of every edge's error, votes bits across
+  every repeated frame in the capture (SIRC sends three), and checks the
+  protocol's own redundancy (inverted bytes, Kaseikyo's parity). The closest
+  fitting protocol wins (NEC and Pioneer differ only in timing).
+- SIRC and Pioneer have no stop mark, so their last bit's interval runs into the
+  next frame and can't be seen. It's taken as 0 (always 0 for Pioneer; SIRC's
+  address top bit, usually 0).
+- Mark lengths aren't visible, so raw (unknown protocol) signals can't be learned.
+- 36 kHz carriers (RC5, RC6) don't arrive as one byte per burst but as a stream of
+  bytes every ~600 µs, also across short spaces: no usable edges. 36000 baud is no
+  better: there even 40 kHz bursts become streams.
+
+`tests/decode_test.c` holds the captures (Flipper `ir tx` at ~5 cm) and checks every protocol with
+jittered timings.
 
 ## Pitfall: `IRU:WaitSendTransfer` cancels
 
@@ -147,21 +178,36 @@ The Flipper firmware's universal `tv.ir`
 useful file: select a `Power` entry and press **Y** to send every `Power` code
 in turn, TV-B-Gone style.
 
+Everything works with the buttons on the top screen; the bottom screen repeats
+them as touch buttons (a remote's buttons, the keyboard, the footer's hints):
+
+- **Remotes**: browse the `.ir` files. **A** opens one, **X** renames or deletes
+  it, **Y** makes a new remote (learn its first button, or empty).
+- A remote: **A** sends the selected button (hold to keep sending), **Y** sends
+  every button with the same name, **L/R** set the repeats per press, **X** edits:
+  learn a new button, re-learn this one, rename, move, delete. Changes are saved
+  to the file right away, in the Flipper's format (comments in it aren't kept).
+- **Learn new remote**: point a remote at the IR port on the back of the 3DS
+  and press a button. Then name the button and the remote, and it is saved as
+  `sdmc:/3ds/3dsir/<name>.ir`.
+- **Settings**: carrier style and repeats, kept in `sdmc:/3ds/3dsir/.settings`.
+- **SELECT** shows the log, **START** exits.
+
 Supported protocols: NEC, NECext, NEC42, NEC42ext, Samsung32, SIRC, SIRC15,
 SIRC20, RC5, RC5X, RC6, Kaseikyo, Pioneer, RCA, and raw.
 
 ### Suggested first test
 
-1. **[Carrier test]**, hold A, and look at the IR port (on the back of the
+1. **Tools > Carrier test**, hold A, and look at the IR port (on the back of the
    N3DS XL) through a phone camera. Front cameras usually have no IR filter.
-2. **[Built-in test codes]**: hold the 3DS about 30 cm from the TV and send
+2. **Built-in test codes**: hold the 3DS about 30 cm from the TV and send
    the Vol+ code for its brand.
 
 ## Debug build
 
 The debug build adds:
 
-- **[IR chip diagnostic]**: closes `ir:u` and talks to the SC16IS750 directly over the `ir`
+- **Tools > IR chip diagnostic**: closes `ir:u` and talks to the SC16IS750 directly over the `ir`
   module's own `i2c::IR` session (see below). It logs every register (the
   divisor, IrDA mode, the bridge's own GPIO pins) and the I2C round-trip time. Then it counts
   what the RX FIFO receives, so you can point a remote at the port. B puts the chip back the
@@ -170,8 +216,8 @@ The debug build adds:
 - A TCP server on port 8020 while Wi-Fi is up. The address is shown on the top screen.
   `tools/irnet.py HOST ...` uses it to:
   - update the app in place (`update`; it relaunches itself through Rosalina's `hb:ldr`),
-    copy `.ir` files onto the SD card (`put`), grab the top screen (`shot`), press
-    buttons (`keys`) and read the log (`log`);
+    copy `.ir` files onto the SD card (`put`), grab either screen (`shot [bottom]`), press
+    buttons (`keys`), tap the touchscreen (`touch X Y`) and read the log (`log`);
   - send codes through `ir:u` from a `.ir` file on the PC (`send FILE NAME`) or by
     protocol (`code NEC 0x04 0x08`), or raw UART bytes (`irusend`);
   - take the SC16IS750 over (`takeover` / `release`), read and write its registers (`regs`,
@@ -224,6 +270,14 @@ cc -O2 -Isource tests/host_test.c source/irenc.c source/irfile.c -o host_test
 The test renders every signal, simulates the IrDA encoder and a receiver, and
 checks the demodulated timings. It also checks known on-air codes: LG power
 `0x20DF10EF`, Samsung power `0xE0E040BF`, and Sony power `0xA90`.
+
+```
+cc -O2 -Isource tests/decode_test.c source/irdecode.c source/irenc.c -o decode_test
+./decode_test
+```
+
+The learning decoder: real captures, and every protocol encoded, reduced to mark starts and
+jittered.
 
 ## License
 
