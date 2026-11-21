@@ -171,8 +171,9 @@ Copy `3DSir.3dsx` (or a local build's `3dsir.3dsx`) to `sdmc:/3ds/` and launch i
 (Luma3DS gives it `ir:u` access), or install `3DSir.cia` and launch it from
 the HOME menu.
 
-Put Flipper Zero `.ir` files in `sdmc:/3ds/3dsir/`. Subfolders work, so the
-whole [Flipper-IRDB](https://github.com/Lucaslhm/Flipper-IRDB) can go there.
+Put Flipper Zero `.ir` files in `sdmc:/3ds/3dsir/`. Subfolders work. The
+[Flipper-IRDB](https://github.com/Lucaslhm/Flipper-IRDB) doesn't need copying:
+**Remote database** downloads it over Wi-Fi.
 The Flipper firmware's universal `tv.ir`
 (`applications/main/infrared/resources/infrared/assets/tv.ir`) is the most
 useful file: select a `Power` entry and press **Y** to send every `Power` code
@@ -187,6 +188,10 @@ them as touch buttons (a remote's buttons, the keyboard, the footer's hints):
   every button with the same name, **L/R** set the repeats per press, **X** edits:
   learn a new button, re-learn this one, rename, move, delete. Changes are saved
   to the file right away, in the Flipper's format (comments in it aren't kept).
+- **Find my remote**: recognizes your remote from a few button presses, with all its
+  buttons, so you don't have to learn them one by one. See "Finding a remote" below.
+- **Remote database**: downloads or updates the Flipper-IRDB over Wi-Fi, or indexes the
+  remotes on the SD card again.
 - **Learn new remote**: point a remote at the IR port on the back of the 3DS
   and press a button. Then name the button and the remote, and it is saved as
   `sdmc:/3ds/3dsir/<name>.ir`.
@@ -195,6 +200,44 @@ them as touch buttons (a remote's buttons, the keyboard, the footer's hints):
 
 Supported protocols: NEC, NECext, NEC42, NEC42ext, Samsung32, SIRC, SIRC15,
 SIRC20, RC5, RC5X, RC6, Kaseikyo, Pioneer, RCA, and raw.
+
+### Finding a remote
+
+**Find my remote** asks you to press Power on your remote (pointed at the IR port), then
+whichever button best tells the remaining candidates apart: Vol+, Mute, a digit, and so on.
+**X** skips a button your remote doesn't have, and **Y** shows the matches so far. A match
+opens like any remote, so you can try its buttons. **X** there saves a copy to the top of
+Remotes.
+
+- It searches every `.ir` file in `sdmc:/3ds/3dsir`, and the Flipper-IRDB once
+  **Remote database** has downloaded it. The download is the newest commit's tarball from GitHub
+  (about 18 MB). It uses libcurl and mbedtls, with the CA bundle built into the app
+  (`data/cacert.pem`, Mozilla's, via curl.se). The ~9000 `.ir` files are packed into one file,
+  `sdmc:/3ds/3dsir/Flipper-IRDB.pack` (~65 MB), and indexed on the way in. That takes about
+  4 minutes on top of the download. The same files as a folder tree took over 25 minutes: on the
+  3DS's SD card each new folder costs ~240 ms and each small file ~60 ms. A finished download
+  is kept until it's unpacked, so a retry doesn't fetch it again. An update replaces the pack only
+  once the new one is complete.
+- **Remotes > Flipper-IRDB** browses the pack like a folder. Its remotes open read-only:
+  **X** saves an editable copy to Remotes. A real folder of that name in `sdmc:/3ds/3dsir`
+  (a copy put there by hand) is hidden while the pack exists. Without the pack, it's
+  searched like any other remotes.
+- The index is kept in `sdmc:/3ds/3dsir/.irdb`, and can always be rebuilt from the pack and
+  the files. Remotes the app saves, renames or deletes are indexed again automatically. After
+  changing `.ir` files on a PC, use **Remote database > Y**.
+- A code's key is what the learning decoder makes of it. Each database signal, parsed or
+  raw, is encoded, cut down to mark starts and decoded, the same way a capture is. So
+  `NECext 04FB/08F7` in one file, `NEC 04/08` in another, and a raw capture of either all
+  match one press. Only codes the 3DS can learn can be matched: 7035 of the Flipper-IRDB's
+  8901 files have at least one. RC5/RC6 remotes and air conditioners' long frames can't be.
+- The next button to ask is the one that leaves the fewest candidates on average. It is
+  only asked if that's at least 15% fewer. Past that point, what's left is mostly the same
+  remote filed more than once. When you're asked for a named button, remotes whose button
+  of that name sends a different code are dropped. Skipping a button drops the remotes that
+  have it (a remote without Down isn't then asked for Up). Neither filter is applied if it
+  would leave no remotes. Simulated on the whole Flipper-IRDB (`tests/irdb_test.c`, every press
+  decoded from jittered mark starts), every remote is found, after 2.75 presses on average. 97.5%
+  end with only remotes that send the same codes for every button you could press.
 
 ### Suggested first test
 
@@ -279,7 +322,17 @@ cc -O2 -Isource tests/decode_test.c source/irdecode.c source/irenc.c -o decode_t
 The learning decoder: real captures, and every protocol encoded, reduced to mark starts and
 jittered.
 
+```
+cc -O2 -Isource tests/irdb_test.c source/irdb.c source/irdecode.c source/irenc.c source/irfile.c -o irdb_test
+./irdb_test [path/to/Flipper-IRDB]
+```
+
+The remote index and the finder: a few made-up remotes. Given a Flipper-IRDB checkout, it also
+finds every detectable remote in it by simulated presses, and prints how many presses that took.
+
 ## License
 
 AGPL-3.0, see `LICENSE`. The protocol encodings follow the Flipper Zero
 firmware's `lib/infrared` (GPL-3.0).
+`data/cacert.pem` is Mozilla's CA certificate list (MPL-2.0), as extracted by curl.se.
+The Flipper-IRDB isn't part of this project: the app downloads it from GitHub when asked.

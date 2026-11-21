@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "irenc.h"
 
@@ -26,6 +27,7 @@ typedef struct {
 
 // Parses a Flipper Zero "IR signals file" / "IR library file".
 bool irfile_load(const char* path, IrFile* out);
+void irfile_read(FILE* fp, IrFile* out); // the same from an open file (or fmemopen)
 void irfile_free(IrFile* f);
 void irfile_init(IrFile* f); // an empty signals file
 // Writes the file the way the Flipper does (comments in it are not kept). Through a temporary file, so

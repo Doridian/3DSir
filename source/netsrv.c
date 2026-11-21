@@ -21,7 +21,6 @@
 #include "irhw.h"
 #include "log.h"
 
-#define SOC_BUFFERSIZE 0x100000
 #define MS(x) ((s64)(x) * 1000000LL)
 
 enum {
@@ -67,19 +66,22 @@ char net_addr[32];
 volatile u32 net_keys;
 volatile u32 net_touch;
 
-static u32* soc_buf;
+static bool soc_up;
 static int listen_fd = -1;
 static Thread net_thread;
 static volatile bool net_quit;
 
 // Waits until fd is readable, in short steps, so net_stop never has to break a blocked socket
-// call (that hangs soc:U, and the system with it).
+// call (that hangs soc:U, and the system with it). The poll itself doesn't wait: every thread's socket
+// calls go through the one soc:U session, which serves one request at a time, so a poll waiting 100 ms
+// held up the remote database download's every recv (a few KB/s, faster only while a client connected).
 static bool wait_readable(int fd) {
     while(!net_quit) {
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int r = poll(&pfd, 1, 100);
+        int r = poll(&pfd, 1, 0);
         if(r < 0) return false;
         if(r > 0) return true;
+        svcSleepThread(MS(20));
     }
     return false;
 }
@@ -485,11 +487,8 @@ static void net_main(void* arg) {
 }
 
 void net_start(void) {
-    soc_buf = memalign(0x1000, SOC_BUFFERSIZE);
-    if(!soc_buf || R_FAILED(socInit(soc_buf, SOC_BUFFERSIZE))) {
+    if(!(soc_up = soc_acquire())) {
         logp("net: socInit failed (no wifi?)\n");
-        free(soc_buf);
-        soc_buf = NULL;
         return;
     }
     listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
@@ -506,7 +505,7 @@ void net_start(void) {
 }
 
 void net_stop(void) {
-    if(!soc_buf) return;
+    if(!soc_up) return;
     net_quit = true;
     if(net_thread) {
         threadJoin(net_thread, U64_MAX);
@@ -528,7 +527,6 @@ void net_stop(void) {
         c->in = c->out = NULL;
     }
     if(listen_fd >= 0) close(listen_fd);
-    socExit();
-    free(soc_buf);
-    soc_buf = NULL;
+    soc_release();
+    soc_up = false;
 }

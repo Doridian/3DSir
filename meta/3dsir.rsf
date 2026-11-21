@@ -1,7 +1,7 @@
 # makerom spec for the CIA (make cia).
 #
 # A .3dsx inherits the Homebrew Launcher's access; a CIA only gets what is listed here. 3DSir needs
-# nothing unusual beyond ir:u, the IR port's UART.
+# nothing unusual beyond ir:u, the IR port's UART, and the network (soc:U, ssl:C) for the remote database.
 
 BasicInfo:
   Title                   : 3DSir
@@ -179,7 +179,8 @@ AccessControlInfo:
 
   InterruptNumbers:
 
-  # Up to 34 services: what libctru uses, plus ir:u.
+  # Up to 34 services: what libctru uses, plus ir:u, and soc:U + ssl:C for downloading the remote database
+  # (mbedtls takes its entropy from ssl:C).
   ServiceAccessControl:
     - APT:U
     - ac:u
@@ -196,6 +197,8 @@ AccessControlInfo:
     - ir:u
     - csnd:SND
     - mcu::HWC
+    - soc:U
+    - ssl:C
 
 SystemControlInfo:
   SaveDataSize: 0KB
@@ -230,5 +233,6 @@ SystemControlInfo:
     pdn: 0x0004013000002102
     ps: 0x0004013000003102
     ptm: 0x0004013000002202
+    socket: 0x0004013000002e02
     ssl: 0x0004013000002f02
     spi: 0x0004013000002302

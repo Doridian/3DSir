@@ -9,6 +9,21 @@
 
 #define ROOT_DIR "sdmc:/3ds/3dsir"
 #define SETTINGS_PATH ROOT_DIR "/.settings" // dotfiles don't show in the browser
+#define IRDB_PACK ROOT_DIR "/Flipper-IRDB.pack" // the downloaded remote database (irdb.h)
+#define IRDB_CACHE ROOT_DIR "/.irdb" // the remote index (irdb.c)
+
+// ---------------------------------------------------------------- network (net.c, irdbget.c)
+
+// soc:U, counted: the debug build's server and the database download share it.
+bool soc_acquire(void);
+void soc_release(void);
+
+// The newest Flipper-IRDB commit on GitHub (40 hex digits). Notes progress with job_note.
+bool irdb_latest(char* sha, size_t max, char* err, size_t errmax);
+// Downloads that commit and packs its remotes into IRDB_PACK (replacing the old pack), indexing each. On
+// failure the old pack and the index's cache are left as they were, and a complete download is kept, so a
+// retry doesn't download it again.
+bool irdb_install(const char* sha, volatile bool* cancel, char* err, size_t errmax);
 
 // ---------------------------------------------------------------- settings (main.c)
 
@@ -76,8 +91,9 @@ void popup(const char* title, const MenuItem* items, int n);
 void toast(const char* fmt, ...) __attribute__((format(printf, 1, 2))); // a short note at the bottom
 
 // Runs run() on a worker thread (hw_lock held), then done() on the UI thread. JOB_CANCEL: B sets
-// job_cancel. JOB_QUIET: a small "title..." note instead of the busy box (short sends).
-enum { JOB_CANCEL = 1, JOB_QUIET = 2 };
+// job_cancel. JOB_QUIET: a small "title..." note instead of the busy box (short sends). JOB_CPU: runs
+// below the UI thread (long computing jobs; the UI stays responsive).
+enum { JOB_CANCEL = 1, JOB_QUIET = 2, JOB_CPU = 4 };
 void job_start(const char* title, void (*run)(void), void (*done)(void), u32 flags);
 bool job_busy(void);
 extern volatile bool job_cancel;

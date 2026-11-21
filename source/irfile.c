@@ -50,7 +50,12 @@ void irfile_init(IrFile* f) {
 bool irfile_load(const char* path, IrFile* out) {
     FILE* fp = fopen(path, "r");
     if(!fp) return false;
+    irfile_read(fp, out);
+    fclose(fp);
+    return true;
+}
 
+void irfile_read(FILE* fp, IrFile* out) {
     irfile_init(out);
     size_t cap = 0;
     IrSignal* cur = NULL;
@@ -92,8 +97,6 @@ bool irfile_load(const char* path, IrFile* out) {
             parse_data(cur, val);
         }
     }
-    fclose(fp);
-    return true;
 }
 
 static void write_le_hex(FILE* fp, const char* key, uint32_t v) {
@@ -205,7 +208,8 @@ bool irfile_signal_timings(const IrSignal* s, unsigned repeats, IrTimings* out) 
                 ir_timings_space(out, s->data[i]);
         }
         // A raw capture's trailing space is the remote's own repeat gap.
-        if(out->n % 2 == 0) gap = out->t[--out->n];
+        if(out->n && out->n % 2 == 0) gap = out->t[--out->n];
+        if(!out->n) return false; // all zeros (some IRDB captures)
     }
     ir_timings_repeat(out, repeats, gap);
     return true;
