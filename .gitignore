@@ -7,3 +7,4 @@ __pycache__/
 *.ir
 *.cia
 host_test
+decode_test

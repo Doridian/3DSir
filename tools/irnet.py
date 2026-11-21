@@ -6,7 +6,8 @@ usage: irnet.py HOST COMMAND [ARGS...]
        update [FILE]                 send a new .3dsx (default: ./3dsir.3dsx), the app restarts into it
        put LOCAL [DEST]              copy a file onto the SD card (default dest: sdmc:/3ds/3dsir/NAME)
        get SDPATH [LOCAL]            fetch a file from the SD card (e.g. sdmc:/3dsir.log), stdout without LOCAL
-       shot [OUT.png]                grab the top screen (needs Pillow)
+       shot [bottom] [OUT.png]       grab the top (or bottom) screen (needs Pillow)
+       touch X Y                     tap the bottom screen at X, Y (0..319, 0..239)
        log [N]                       the app log's last N lines (default 50)
        keys KEY [KEY...]             press buttons, one frame each (a b x y l r up down left right start select)
   Sending through ir:u (the normal path):
@@ -42,7 +43,7 @@ PORT = 8020
 (OP_PING, OP_TAKEOVER, OP_RELEASE, OP_REG_READ, OP_REG_WRITE, OP_GPIO, OP_I2C, OP_IPC, OP_UPDATE,
  OP_UPDATE_DONE, OP_PUT_FILE, OP_BENCH, OP_TX, OP_RX, OP_SEND, OP_IRU_SEND) = range(16)
 OP_SET_TRIM = 0x10
-OP_SHOT, OP_KEYS, OP_LOG, OP_GET_FILE = 0x20, 0x21, 0x24, 0x25
+OP_SHOT, OP_KEYS, OP_TOUCH, OP_LOG, OP_GET_FILE = 0x20, 0x21, 0x22, 0x24, 0x25
 CHUNK = 0x7000
 ROOT = "sdmc:/3ds/3dsir/"
 KEYS = {"a": 1 << 0, "b": 1 << 1, "select": 1 << 2, "start": 1 << 3, "right": 1 << 4, "left": 1 << 5,
@@ -100,17 +101,18 @@ class Ir:
         for o in range(0, max(len(data), 1), CHUNK):
             self.call(OP_PUT_FILE, struct.pack("<IB", o, len(p)) + p + data[o:o + CHUNK])
 
-    def shot(self):
+    def shot(self, bottom=False):
         from PIL import Image
         raw = b""
         while True:
-            chunk = self.call(OP_SHOT, struct.pack("<I", len(raw)))
+            chunk = self.call(OP_SHOT, struct.pack("<IB", len(raw), 1 if bottom else 0))
             if not chunk:
                 break
             raw += chunk
-        bpp = len(raw) // (240 * 400)  # the console draws in RGB565, other formats are BGR8 / ABGR8
+        h = 320 if bottom else 400
+        bpp = len(raw) // (240 * h)  # citro2d draws BGR8; RGB565 / ABGR8 just in case
         mode = {2: ("BGR;16", "RGB"), 3: ("BGR", "RGB"), 4: ("ABGR", "RGBA")}[bpp]
-        img = Image.frombytes(mode[1], (240, 400), raw, "raw", mode[0])
+        img = Image.frombytes(mode[1], (240, h), raw, "raw", mode[0])
         return img.transpose(Image.Transpose.ROTATE_90)
 
     def get_file(self, path):
@@ -129,6 +131,9 @@ class Ir:
 
     def keys(self, mask):
         self.call(OP_KEYS, struct.pack("<I", mask))
+
+    def touch(self, x, y):
+        self.call(OP_TOUCH, struct.pack("<HH", x, y))
 
     # ir:u
     def send_parsed(self, protocol, address, command, repeats=1, clean=False):
@@ -261,9 +266,13 @@ def main():
         else:
             sys.stdout.write(data.decode(errors="replace"))
     elif what == "shot":
+        bottom = bool(args) and args[0] == "bottom"
+        args = args[1:] if bottom else args
         out = args[0] if args else "shot.png"
-        ir.shot().save(out)
+        ir.shot(bottom).save(out)
         print("saved", out)
+    elif what == "touch":
+        ir.touch(int(args[0]), int(args[1]))
     elif what == "log":
         lines = ir.log(int(args[0]) if args else 50).splitlines()
         print("\n".join(l for l in lines if not l.startswith("net: client")))

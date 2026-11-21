@@ -42,11 +42,16 @@ static void parse_data(IrSignal* sig, const char* s) {
     }
 }
 
+void irfile_init(IrFile* f) {
+    memset(f, 0, sizeof(*f));
+    snprintf(f->filetype, sizeof(f->filetype), "IR signals file");
+}
+
 bool irfile_load(const char* path, IrFile* out) {
     FILE* fp = fopen(path, "r");
     if(!fp) return false;
 
-    memset(out, 0, sizeof(*out));
+    irfile_init(out);
     size_t cap = 0;
     IrSignal* cur = NULL;
     static char line[16384];
@@ -58,7 +63,9 @@ bool irfile_load(const char* path, IrFile* out) {
         char* key = trim(line);
         char* val = trim(colon + 1);
 
-        if(!strcmp(key, "name")) {
+        if(!strcmp(key, "Filetype")) {
+            snprintf(out->filetype, sizeof(out->filetype), "%s", val);
+        } else if(!strcmp(key, "name")) {
             if(out->n == cap) {
                 cap = cap ? cap * 2 : 32;
                 out->sig = realloc(out->sig, cap * sizeof(IrSignal));
@@ -78,6 +85,8 @@ bool irfile_load(const char* path, IrFile* out) {
             cur->command = parse_le_hex(val);
         } else if(!strcmp(key, "frequency")) {
             cur->frequency = strtoul(val, NULL, 10);
+        } else if(!strcmp(key, "duty_cycle")) {
+            snprintf(cur->duty, sizeof(cur->duty), "%s", val);
         } else if(!strcmp(key, "data")) {
             free(cur->data);
             parse_data(cur, val);
@@ -85,6 +94,90 @@ bool irfile_load(const char* path, IrFile* out) {
     }
     fclose(fp);
     return true;
+}
+
+static void write_le_hex(FILE* fp, const char* key, uint32_t v) {
+    fprintf(fp, "%s: %02X %02X %02X %02X\n", key, (unsigned)(v & 0xFF), (unsigned)(v >> 8 & 0xFF),
+            (unsigned)(v >> 16 & 0xFF), (unsigned)(v >> 24));
+}
+
+bool irfile_save(const IrFile* f, const char* path) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE* fp = fopen(tmp, "w");
+    if(!fp) return false;
+    static char buf[8192];
+    setvbuf(fp, buf, _IOFBF, sizeof(buf));
+    fprintf(fp, "Filetype: %s\nVersion: 1\n", *f->filetype ? f->filetype : "IR signals file");
+    for(size_t i = 0; i < f->n; i++) {
+        const IrSignal* s = &f->sig[i];
+        fprintf(fp, "# \nname: %s\n", s->name);
+        if(s->raw) {
+            fprintf(fp, "type: raw\nfrequency: %lu\nduty_cycle: %s\ndata:", (unsigned long)s->frequency,
+                    *s->duty ? s->duty : "0.330000");
+            for(size_t k = 0; k < s->data_n; k++) fprintf(fp, " %lu", (unsigned long)s->data[k]);
+            fputc('\n', fp);
+        } else {
+            fprintf(fp, "type: parsed\nprotocol: %s\n", s->protocol);
+            write_le_hex(fp, "address", s->address);
+            write_le_hex(fp, "command", s->command);
+        }
+    }
+    bool ok = !ferror(fp);
+    ok &= !fclose(fp);
+    if(!ok) {
+        remove(tmp);
+        return false;
+    }
+    remove(path); // FAT's rename doesn't replace
+    return !rename(tmp, path);
+}
+
+static void copy_code(IrSignal* d, const IrSignal* s) {
+    free(d->data);
+    char name[sizeof(d->name)];
+    memcpy(name, d->name, sizeof(name));
+    *d = *s;
+    memcpy(d->name, name, sizeof(name));
+    d->data = NULL;
+    if(s->raw && s->data_n) {
+        d->data = malloc(s->data_n * sizeof(uint32_t));
+        memcpy(d->data, s->data, s->data_n * sizeof(uint32_t));
+    }
+}
+
+void irfile_add(IrFile* f, const IrSignal* s) {
+    f->sig = realloc(f->sig, (f->n + 1) * sizeof(IrSignal));
+    IrSignal* d = &f->sig[f->n++];
+    memset(d, 0, sizeof(*d));
+    memcpy(d->name, s->name, sizeof(d->name));
+    copy_code(d, s);
+}
+
+void irfile_remove(IrFile* f, size_t i) {
+    if(i >= f->n) return;
+    free(f->sig[i].data);
+    memmove(&f->sig[i], &f->sig[i + 1], (f->n - i - 1) * sizeof(IrSignal));
+    f->n--;
+}
+
+void irfile_move(IrFile* f, size_t from, size_t to) {
+    if(from >= f->n || to >= f->n || from == to) return;
+    IrSignal s = f->sig[from];
+    if(from < to) memmove(&f->sig[from], &f->sig[from + 1], (to - from) * sizeof(IrSignal));
+    else memmove(&f->sig[to + 1], &f->sig[to], (from - to) * sizeof(IrSignal));
+    f->sig[to] = s;
+}
+
+void irfile_replace_code(IrFile* f, size_t i, const IrSignal* s) {
+    if(i < f->n) copy_code(&f->sig[i], s);
+}
+
+void irfile_describe(const IrSignal* s, char* out, size_t max) {
+    if(s->raw)
+        snprintf(out, max, "raw, %lu kHz, %zu samples", (unsigned long)(s->frequency + 500) / 1000, s->data_n);
+    else
+        snprintf(out, max, "%s  %02lX / %02lX", s->protocol, (unsigned long)s->address, (unsigned long)s->command);
 }
 
 void irfile_free(IrFile* f) {

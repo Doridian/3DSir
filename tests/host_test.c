@@ -123,7 +123,7 @@ static int run(int argc, char** argv) {
         }
         size_t ok = 0, unsupported = 0, longest = 0;
         for(size_t i = 0; i < f.n; i++) {
-            char label[96];
+            char label[128];
             snprintf(label, sizeof(label), "#%zu %s (%s)", i, f.sig[i].name,
                      f.sig[i].raw ? "raw" : f.sig[i].protocol);
             if(!irfile_signal_timings(&f.sig[i], 3, &want)) {
