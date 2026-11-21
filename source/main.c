@@ -6,11 +6,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "app.h"
 #include "irenc.h"
 #include "irfile.h"
+#include "irhw.h"
+#include "log.h"
 
-#define ROOT_DIR "sdmc:/3ds/3dsir"
 #define IRU_MAX_TRANSFER 0x800
+#define LOG_PATH "sdmc:/3dsir.log" // debug build only
 #define LIST_ROWS 26
 
 static PrintConsole top, bottom;
@@ -22,6 +25,76 @@ static unsigned repeats = 3;
 static u8* txbuf;
 static size_t txbuf_cap;
 static Handle send_event;
+static u32* iru_shm;
+static bool iru_ok; // ir:u open (false while the hardware is taken over)
+
+LightLock hw_lock;
+char app_path[256] = "sdmc:/3ds/3dsir.3dsx";
+volatile bool restart_requested;
+
+// ---------------------------------------------------------------- input
+
+// Buttons this frame: the real ones plus any the debug build's net server pressed.
+static u32 keys_down, keys_held;
+
+static void scan_input(void) {
+    hidScanInput();
+    u32 net = 0;
+#ifndef APP_RELEASE
+    net = __atomic_exchange_n(&net_keys, 0, __ATOMIC_SEQ_CST);
+#endif
+    keys_down = hidKeysDown() | net;
+    keys_held = hidKeysHeld() | net;
+}
+
+static bool running(void) {
+    return !restart_requested && aptMainLoop();
+}
+
+// ---------------------------------------------------------------- ir:u
+
+static Result iru_open(void) {
+    if(iru_ok) return 0;
+    if(!iru_shm) iru_shm = memalign(0x1000, 0x1000);
+    Result rc = -1;
+    // Right after a relaunch the module may not have registered ir:u yet.
+    for(int t = 0; t < 20; t++) {
+        rc = iruInit(iru_shm, 0x1000);
+        if(R_SUCCEEDED(rc)) break;
+        svcSleepThread(100000000LL);
+    }
+    logp("iruInit: %08lX\n", rc);
+    if(R_FAILED(rc)) return rc;
+    IRU_GetBitRate(&cur_bitrate);
+    rc = IRU_GetSendFinishedEvent(&send_event);
+    if(R_FAILED(rc)) logp("GetSendFinishedEvent: %08lX\n", rc);
+    iru_ok = true;
+    return 0;
+}
+
+static void iru_close(void) {
+    if(!iru_ok) return;
+    svcCloseHandle(send_event);
+    send_event = 0;
+    iruExit();
+    iru_ok = false;
+}
+
+Result app_hw_direct(void) {
+    iru_close();
+    Result rc = irhw_takeover();
+    // While the ir module is gone the HOME menu would hang waiting for it.
+    aptSetHomeAllowed(false);
+    aptSetSleepAllowed(false);
+    return rc;
+}
+
+void app_hw_iru(void) {
+    irhw_give_back(); // also when the takeover failed halfway: the module may be stopped already
+    iru_open();
+    aptSetHomeAllowed(true);
+    aptSetSleepAllowed(true);
+}
 
 // ---------------------------------------------------------------- sending
 
@@ -112,8 +185,10 @@ static Result set_carrier(const IrCarrier* c) {
     return rc;
 }
 
-static Result send_timings(const IrTimings* tm) {
-    const IrCarrier* c = ir_pick_carrier(tm->freq, style);
+// Sends a waveform through ir:u (hw_lock held). *bytes = UART bytes rendered.
+static Result send_timings_locked(const IrTimings* tm, IrCarrierStyle st, u32* bytes) {
+    if(!iru_ok) return -2; // the hardware is taken over
+    const IrCarrier* c = ir_pick_carrier(tm->freq, st);
     Result rc = set_carrier(c);
     if(R_FAILED(rc)) return rc;
 
@@ -124,27 +199,54 @@ static Result send_timings(const IrTimings* tm) {
         txbuf = malloc(n);
     }
     ir_render_uart(tm, c, txbuf, n);
+    if(bytes) *bytes = n;
     return send_bytes(txbuf, n, c->baud, ir_space_byte(c));
+}
+
+Result app_send(const IrTimings* tm, IrCarrierStyle st, u32* bytes) {
+    return send_timings_locked(tm, st, bytes); // the net server holds hw_lock already
+}
+
+static Result send_timings(const IrTimings* tm) {
+    LightLock_Lock(&hw_lock);
+    Result rc = send_timings_locked(tm, style, NULL);
+    LightLock_Unlock(&hw_lock);
+    return rc;
+}
+
+static const u32 iru_nominal[19] = {[3] = 115200, 96000, 72000, 48000, 36000, 24000, 18000, 12000,
+                                    9600, 6000, 3000, 57600, 38400, 19200, 7200, 4800};
+
+Result app_iru_send(u8 bitrate, const u8* data, u32 len, u32* us) {
+    if(!iru_ok) return -2;
+    if(bitrate < 3 || bitrate > 18 || !len) return -3;
+    Result rc = IRU_SetBitRate(bitrate);
+    cur_bitrate = R_SUCCEEDED(rc) ? bitrate : 0;
+    if(R_FAILED(rc)) return rc;
+    u64 t0 = svcGetSystemTick();
+    rc = send_bytes(data, len, iru_nominal[bitrate], 0xFF);
+    *us = irhw_us(svcGetSystemTick() - t0);
+    return rc;
 }
 
 static void carrier_test(void) {
     static u8 carrier[IRU_MAX_TRANSFER];
     const IrCarrier* c = ir_pick_carrier(38000, style);
     memset(carrier, c->cycle_slots == 2 ? 0x55 : 0x00, sizeof(carrier));
-    consoleSelect(&bottom);
-    printf("Carrier test %lu Hz: hold A (B to exit)\n", c->baud / c->cycle_slots);
-    printf("Look at the IR port through a phone camera.\n");
-    Result rc = set_carrier(c);
-    if(R_FAILED(rc)) printf("SetBitRate: %08lX\n", rc);
+    logp("Carrier test %lu Hz: hold A (B to exit)\n", c->baud / c->cycle_slots);
+    logp("Look at the IR port through a phone camera.\n");
 
-    while(aptMainLoop()) {
-        hidScanInput();
-        u32 held = hidKeysHeld();
-        if(hidKeysDown() & KEY_B) break;
+    while(running()) {
+        scan_input();
+        u32 held = keys_held;
+        if(keys_down & KEY_B) break;
         if(held & KEY_A) {
-            rc = send_bytes(carrier, sizeof(carrier), c->baud, ir_space_byte(c));
+            LightLock_Lock(&hw_lock);
+            Result rc = iru_ok ? set_carrier(c) : -2;
+            if(R_SUCCEEDED(rc)) rc = send_bytes(carrier, sizeof(carrier), c->baud, ir_space_byte(c));
+            LightLock_Unlock(&hw_lock);
             if(R_FAILED(rc)) {
-                printf("send: %08lX\n", rc);
+                logp("send: %08lX\n", rc);
                 svcSleepThread(500000000LL);
             }
         } else {
@@ -157,13 +259,14 @@ static void carrier_test(void) {
 // the UART busy the whole time, the measured rate matches the nominal one; a
 // lower rate means gaps between bytes (or that SetBitRate did not take).
 static void timing_check(void) {
-    static const u32 nominal[19] = {[3] = 115200, 96000, 72000, 48000, 36000, 24000, 18000, 12000,
-                                    9600, 6000, 3000, 57600, 38400, 19200, 7200, 4800};
+    const u32* nominal = iru_nominal;
     static u8 data[IRU_MAX_TRANSFER];
     consoleSelect(&bottom);
     consoleClear();
-    printf("val nominal  got   ms  measured\n");
-    for(u8 v = 3; v <= 18 && aptMainLoop(); v++) {
+    LightLock_Lock(&hw_lock);
+    if(!iru_ok) logp("ir:u is closed (hardware taken over)\n");
+    logp("val nominal  got   ms  measured\n");
+    for(u8 v = 3; v <= 18 && iru_ok && running(); v++) {
         size_t n = nominal[v] >= 36000 ? sizeof(data) : 256;
         Result rc = IRU_SetBitRate(v);
         u8 got = 0;
@@ -172,19 +275,20 @@ static void timing_check(void) {
         if(R_SUCCEEDED(rc)) rc = send_chunk(data, n, nominal[v]);
         u64 ticks = svcGetSystemTick() - t0;
         if(R_FAILED(rc)) {
-            printf("%3u %7lu %4u  err %08lX\n", v, nominal[v], got, rc);
+            logp("%3u %7lu %4u  err %08lX\n", v, nominal[v], got, rc);
             continue;
         }
         u32 us = ticks * 1000000 / SYSCLOCK_ARM11;
-        printf("%3u %7lu %4u %4lu %8llu\n", v, nominal[v], got, us / 1000,
+        logp("%3u %7lu %4u %4lu %8llu\n", v, nominal[v], got, us / 1000,
                (u64)n * 10 * 1000000 / (us ? us : 1));
     }
     cur_bitrate = 0; // force a SetBitRate on the next send
-    printf("B to go back\n");
-    while(aptMainLoop()) {
+    LightLock_Unlock(&hw_lock);
+    logp("B to go back\n");
+    while(running()) {
         gspWaitForVBlank();
-        hidScanInput();
-        if(hidKeysDown() & KEY_B) break;
+        scan_input();
+        if(keys_down & KEY_B) break;
     }
 }
 
@@ -195,8 +299,7 @@ static void adjust_repeats(u32 down) {
     if((down & KEY_L) && repeats > 1) repeats--;
     if((down & KEY_R) && repeats < 10) repeats++;
     if(repeats != old) {
-        consoleSelect(&bottom);
-        printf("Repeats: %u\n", repeats);
+        logp("Repeats: %u\n", repeats);
     }
 }
 
@@ -223,30 +326,28 @@ static int move_sel(u32 down, size_t n, size_t* sel) {
 
 static void report(const IrSignal* s, Result rc, const IrTimings* tm) {
     const IrCarrier* c = ir_pick_carrier(tm->freq, style);
-    consoleSelect(&bottom);
     if(s->raw)
-        printf("%.20s raw %luHz", s->name, s->frequency);
+        logp("%.20s raw %luHz", s->name, s->frequency);
     else
-        printf("%.20s %s %lX/%lX", s->name, s->protocol, s->address, s->command);
+        logp("%.20s %s %lX/%lX", s->name, s->protocol, s->address, s->command);
     if(R_FAILED(rc))
-        printf(" \x1b[31m%08lX\x1b[0m\n", rc);
+        logp(" \x1b[31m%08lX\x1b[0m\n", rc);
     else
-        printf(" %uB @%lu\n", ir_render_uart(tm, c, NULL, 0), c->baud);
+        logp(" %uB @%lu\n", ir_render_uart(tm, c, NULL, 0), c->baud);
     if(R_SUCCEEDED(rc))
-        printf("  pre %u ev %ld/%lu ms%s\n", last_send.state_before, last_send.event_ms,
+        logp("  pre %u ev %ld/%lu ms%s\n", last_send.state_before, last_send.event_ms,
                last_send.expected_ms, last_send.stuck ? " \x1b[33mstuck\x1b[0m" : "");
 }
 
 // Sends every signal named like `name` (e.g. all "Power" codes in a universal
 // library), one after another, until done or B is pressed.
 static void sweep(IrFile* f, const char* name, IrTimings* tm) {
-    consoleSelect(&bottom);
-    printf("\x1b[32mSweeping \"%s\", B to stop\x1b[0m\n", name);
+    logp("\x1b[32mSweeping \"%s\", B to stop\x1b[0m\n", name);
     size_t count = 0;
-    for(size_t i = 0; i < f->n && aptMainLoop(); i++) {
-        hidScanInput();
-        if(hidKeysDown() & KEY_B) {
-            printf("stopped\n");
+    for(size_t i = 0; i < f->n && running(); i++) {
+        scan_input();
+        if(keys_down & KEY_B) {
+            logp("stopped\n");
             return;
         }
         if(strcmp(f->sig[i].name, name)) continue;
@@ -256,7 +357,7 @@ static void sweep(IrFile* f, const char* name, IrTimings* tm) {
         count++;
         svcSleepThread(150000000LL); // let the TV settle between codes
     }
-    printf("sent %zu codes\n", count);
+    logp("sent %zu codes\n", count);
 }
 
 static void signal_menu(IrFile* f, const char* title) {
@@ -267,10 +368,10 @@ static void signal_menu(IrFile* f, const char* title) {
     ir_timings_init(&tm);
     draw_list(title, items, f->n, sel, "A send  Y sweep same name  B back");
 
-    while(aptMainLoop()) {
+    while(running()) {
         gspWaitForVBlank();
-        hidScanInput();
-        u32 down = hidKeysDown();
+        scan_input();
+        u32 down = keys_down;
         if(down & KEY_B) break;
         if(move_sel(down, f->n, &sel)) draw_list(title, items, f->n, sel, "A send  Y sweep same name  B back");
         adjust_repeats(down);
@@ -279,8 +380,7 @@ static void signal_menu(IrFile* f, const char* title) {
         if(down & KEY_A) {
             IrSignal* s = &f->sig[sel];
             if(!irfile_signal_timings(s, repeats, &tm)) {
-                consoleSelect(&bottom);
-                printf("unsupported: %s\n", s->raw ? "raw" : s->protocol);
+                logp("unsupported: %s\n", s->raw ? "raw" : s->protocol);
                 continue;
             }
             // Keep resending the same waveform (same RC5/RC6 toggle bit) while held.
@@ -289,8 +389,8 @@ static void signal_menu(IrFile* f, const char* title) {
                 report(s, rc, &tm);
                 if(R_FAILED(rc)) break;
                 svcSleepThread(40000000LL);
-                hidScanInput();
-            } while(hidKeysHeld() & KEY_A);
+                scan_input();
+            } while(keys_held & KEY_A);
         }
         if(down & KEY_Y) {
             sweep(f, f->sig[sel].name, &tm);
@@ -358,40 +458,101 @@ static size_t list_dir(const char* path, char*** out) {
     return n;
 }
 
+#ifdef APP_RELEASE
+#define ROOT_EXTRA 3
+#else
+#define ROOT_EXTRA 4
+
+// Takes the SC16IS750 over (the ir module stops), logs its registers and the I2C round-trip
+// time, then counts what the RX FIFO receives until B: point a remote at the port.
+static void chip_diag(void) {
+    consoleSelect(&bottom);
+    consoleClear();
+    logp("\x1b[36mIR chip diagnostic\x1b[0m\n");
+    LightLock_Lock(&hw_lock);
+    Result rc = app_hw_direct();
+    if(R_SUCCEEDED(rc)) {
+        irhw_dump();
+        u32 mn, avg, mx;
+        rc = irhw_bench(200, &mn, &avg, &mx);
+        logp("I2C reg read: min %lu avg %lu max %lu us (%08lX)\n", mn, avg, mx, rc);
+    } else {
+        logp("takeover failed: %08lX\n", rc);
+    }
+    LightLock_Unlock(&hw_lock);
+
+    logp("RX: point a remote at the port. B: give back\n");
+    u32 bytes = 0, polls = 0;
+    u64 t0 = svcGetSystemTick();
+    while(running()) {
+        scan_input();
+        if(keys_down & KEY_B) break;
+        LightLock_Lock(&hw_lock);
+        u8 lvl = 0, buf[64];
+        if(irhw_owned() && R_SUCCEEDED(sc_get(SC_RXLVL, &lvl)) && lvl) {
+            if(lvl > 64) lvl = 64;
+            sc_read(SC_RHR, buf, lvl);
+            bytes += lvl;
+        }
+        LightLock_Unlock(&hw_lock);
+        polls++;
+        if(!irhw_owned()) svcSleepThread(16000000LL);
+        if(irhw_us(svcGetSystemTick() - t0) >= 500000) {
+            if(bytes) logp("RX %lu bytes in 0.5 s (%lu polls)\n", bytes, polls);
+            bytes = polls = 0;
+            t0 = svcGetSystemTick();
+        }
+    }
+
+    LightLock_Lock(&hw_lock);
+    app_hw_iru();
+    LightLock_Unlock(&hw_lock);
+    logp("ir module back\n");
+}
+#endif
+
 static void browse(const char* path, bool is_root) {
     char** names;
     size_t n = list_dir(path, &names);
-    size_t extra = is_root ? 3 : 0;
+    size_t extra = is_root ? ROOT_EXTRA : 0;
     char** items = malloc((n + extra) * sizeof(char*));
     if(is_root) {
         items[0] = "[Built-in test codes]";
         items[1] = "[Carrier test]";
         items[2] = "[Bit rate / timing check]";
+#ifndef APP_RELEASE
+        items[3] = "[IR chip diagnostic]";
+#endif
     }
     memcpy(items + extra, names, n * sizeof(char*));
     size_t total = n + extra, sel = 0;
     const char* help = is_root ? "A open X IR LED SELECT carrier START exit" : "A open  B back";
-    draw_list(path, items, total, sel, help);
+    char title[64];
+    snprintf(title, sizeof(title), "%s", path);
+#ifndef APP_RELEASE
+    if(is_root && *net_addr) snprintf(title, sizeof(title), "%s  net %s", path, net_addr);
+#endif
+    draw_list(title, items, total, sel, help);
 
-    while(aptMainLoop()) {
+    while(running()) {
         gspWaitForVBlank();
-        hidScanInput();
-        u32 down = hidKeysDown();
+        scan_input();
+        u32 down = keys_down;
         if(is_root && (down & KEY_START)) break;
         if(!is_root && (down & KEY_B)) break;
-        if(move_sel(down, total, &sel)) draw_list(path, items, total, sel, help);
+        if(move_sel(down, total, &sel)) draw_list(title, items, total, sel, help);
 
         adjust_repeats(down);
         if(down & KEY_SELECT) {
             style = style == IrCarrierClean ? IrCarrierDense : IrCarrierClean;
-            consoleSelect(&bottom);
-            printf("Carrier style: %s\n", style == IrCarrierClean ? "clean (0x55, 36/48/57.6k)" : "dense (0x00, 36/38.4k)");
+            logp("Carrier style: %s\n", style == IrCarrierClean ? "clean (0x55, 36/48/57.6k)" : "dense (0x00, 36/38.4k)");
         }
         if(down & KEY_X) {
             led_state = !led_state;
-            Result rc = IRU_SetIRLEDState(led_state);
-            consoleSelect(&bottom);
-            printf("SetIRLEDState(%d): %08lX\n", led_state, rc);
+            LightLock_Lock(&hw_lock);
+            Result rc = iru_ok ? IRU_SetIRLEDState(led_state) : -2;
+            LightLock_Unlock(&hw_lock);
+            logp("SetIRLEDState(%d): %08lX\n", led_state, rc);
         }
         if(!(down & KEY_A) || !total) continue;
 
@@ -401,6 +562,10 @@ static void browse(const char* path, bool is_root) {
             carrier_test();
         } else if(is_root && sel == 2) {
             timing_check();
+#ifndef APP_RELEASE
+        } else if(is_root && sel == 3) {
+            chip_diag();
+#endif
         } else {
             char sub[512];
             const char* name = items[sel];
@@ -411,17 +576,16 @@ static void browse(const char* path, bool is_root) {
                 browse(sub, false);
             } else {
                 IrFile f;
-                consoleSelect(&bottom);
                 if(irfile_load(sub, &f)) {
-                    printf("%s: %zu signals\n", name, f.n);
+                    logp("%s: %zu signals\n", name, f.n);
                     signal_menu(&f, name);
                     irfile_free(&f);
                 } else {
-                    printf("cannot open %s\n", sub);
+                    logp("cannot open %s\n", sub);
                 }
             }
         }
-        draw_list(path, items, total, sel, help);
+        draw_list(title, items, total, sel, help);
     }
 
     for(size_t i = 0; i < n; i++) free(names[i]);
@@ -429,38 +593,79 @@ static void browse(const char* path, bool is_root) {
     free(items);
 }
 
-int main(void) {
+// Relaunch the (updated) .3dsx the way the Homebrew Menu starts one under Luma: tell Rosalina's
+// hb:ldr the target and its argv, then soft-reset into it. Without hb:ldr this is a plain exit.
+static void relaunch_self(void) {
+    Handle hbldr;
+    if(R_FAILED(svcConnectToPort(&hbldr, "hb:ldr"))) return;
+    const char* path = strncmp(app_path, "sdmc:/", 6) ? app_path : app_path + 5; // SD-relative
+    static u32 args[0x400 / 4]; // argc, then the NUL-separated strings
+    args[0] = 1;
+    strcpy((char*)(args + 1), app_path);
+    u32* cmd = getThreadCommandBuffer();
+    cmd[0] = IPC_MakeHeader(2, 0, 2); // SetTarget
+    cmd[1] = IPC_Desc_StaticBuffer(strlen(path) + 1, 0);
+    cmd[2] = (u32)path;
+    Result rc = svcSendSyncRequest(hbldr);
+    if(R_SUCCEEDED(rc)) rc = cmd[1];
+    if(R_SUCCEEDED(rc)) {
+        cmd[0] = IPC_MakeHeader(3, 0, 2); // SetArgv
+        cmd[1] = IPC_Desc_StaticBuffer(sizeof(args), 1);
+        cmd[2] = (u32)args;
+        rc = svcSendSyncRequest(hbldr);
+        if(R_SUCCEEDED(rc)) rc = cmd[1];
+    }
+    svcCloseHandle(hbldr);
+    if(R_SUCCEEDED(rc)) aptSetChainloaderToSelf();
+}
+
+int main(int argc, char* argv[]) {
+    if(argc > 0 && argv[0] && !strncmp(argv[0], "sdmc:/", 6)) snprintf(app_path, sizeof(app_path), "%s", argv[0]);
     gfxInitDefault();
     consoleInit(GFX_TOP, &top);
     consoleInit(GFX_BOTTOM, &bottom);
     consoleSelect(&bottom);
+    LightLock_Init(&hw_lock);
+#ifdef APP_RELEASE
+    log_init(&bottom, NULL);
+    logp("3DSir (built " __DATE__ " " __TIME__ ")\n");
+#else
+    log_init(&bottom, LOG_PATH);
+    logp("--- 3DSir debug (built " __DATE__ " " __TIME__ ") ---\n");
+    logp("app: %s\n", app_path);
+    net_start();
+#endif
 
-    u32* iru_shm = memalign(0x1000, 0x1000);
-    Result rc = iruInit(iru_shm, 0x1000);
-    printf("iruInit: %08lX\n", rc);
+    Result rc = iru_open();
     if(R_SUCCEEDED(rc)) {
-        IRU_GetBitRate(&cur_bitrate);
-        rc = IRU_GetSendFinishedEvent(&send_event);
-        printf("GetSendFinishedEvent: %08lX\n", rc);
-        printf("default bitrate value: %u\n", cur_bitrate);
-        printf("Carrier style: dense (SELECT toggles)\n");
-        printf("Repeats: %u (L/R adjust)\n", repeats);
+        logp("default bitrate value: %u\n", cur_bitrate);
+        logp("Carrier style: dense (SELECT toggles)\n");
+        logp("Repeats: %u (L/R adjust)\n", repeats);
         mkdir(ROOT_DIR, 0777);
-        printf("Put Flipper .ir files in\n" ROOT_DIR "/\n");
+        logp("Put Flipper .ir files in\n" ROOT_DIR "/\n");
         browse(ROOT_DIR, true);
-        svcCloseHandle(send_event);
-        iruExit();
     } else {
-        printf("ir:u unavailable. START to exit.\n");
-        while(aptMainLoop()) {
+        logp("ir:u unavailable. START to exit.\n");
+        while(running()) {
             gspWaitForVBlank();
-            hidScanInput();
-            if(hidKeysDown() & KEY_START) break;
+            scan_input();
+            if(keys_down & KEY_START) break;
         }
     }
+
+#ifndef APP_RELEASE
+    net_stop();
+#endif
+    LightLock_Lock(&hw_lock);
+    if(!iru_ok) app_hw_iru(); // a net client left the hardware taken over
+    iru_close();
+    LightLock_Unlock(&hw_lock);
+    logp("--- exit ---\n");
+    log_exit();
 
     free(txbuf);
     free(iru_shm);
     gfxExit();
+    if(restart_requested) relaunch_self();
     return 0;
 }

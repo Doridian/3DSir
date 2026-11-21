@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # 3dsir.3dsx and 3dsir.cia
+  # The debug build (3dsir.3dsx) and the release build (3dsir-release.3dsx + .cia)
   build:
     name: 3DSir
     runs-on: ubuntu-latest
@@ -38,14 +38,17 @@ jobs:
           make -C Project_CTR-makerom-v0.19.0/makerom -j"$(nproc)" program
           python3 -m zipfile -e bannertool.zip bannertool
           install -m755 Project_CTR-makerom-v0.19.0/makerom/bin/makerom bannertool/linux-x86_64/bannertool /usr/local/bin/
-      - name: Build (.3dsx and .cia)
+      - name: Build (debug)
+        run: make -j"$(nproc)"
+      - name: Build (release, .3dsx and .cia)
         run: make -j"$(nproc)" cia
       - uses: actions/upload-artifact@v7
         with:
           name: 3DSir
           path: |
             3dsir.3dsx
-            3dsir.cia
+            3dsir-release.3dsx
+            3dsir-release.cia
 
   # The encoder on the host (tests/host_test.c): every protocol rendered, run through a simulated IrDA
   # encoder and receiver, and checked against known on-air codes.
@@ -58,7 +61,7 @@ jobs:
       - name: Run
         run: ./host_test
 
-  # A v* tag: the .3dsx and the .cia as a GitHub release.
+  # A v* tag: both builds and the release CIA as a GitHub release.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build, host-test]
@@ -71,11 +74,13 @@ jobs:
           name: 3DSir
       - name: Name the files
         run: |
-          mv 3dsir.3dsx 3DSir.3dsx
-          mv 3dsir.cia 3DSir.cia
+          mv 3dsir-release.3dsx 3DSir.3dsx
+          mv 3dsir.3dsx 3DSir-debug.3dsx
+          mv 3dsir-release.cia 3DSir.cia
       - uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
             3DSir.3dsx
+            3DSir-debug.3dsx
             3DSir.cia

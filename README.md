@@ -97,6 +97,7 @@ CI builds every `v*` tag into a release:
 | --- | --- |
 | `3DSir.3dsx` | The Homebrew Launcher. |
 | `3DSir.cia` | The same build, to install to the HOME menu (e.g. with FBI). |
+| `3DSir-debug.3dsx` | Development: adds the IR chip diagnostic, a TCP debug server on port 8020 and a log file on the SD card. |
 
 Builds of every commit are attached to its CI run as artifacts.
 
@@ -108,7 +109,8 @@ Build with devkitARM:
 docker run --rm -v "$PWD":/src:Z -w /src docker.io/devkitpro/devkitarm make
 ```
 
-`make cia` also builds `3dsir.cia`; it needs
+`make` is the debug build (`3dsir.3dsx`), `make release` the release build (`3dsir-release.3dsx`).
+`make cia` builds the release build as `3dsir-release.cia` (there is no debug CIA); it needs
 [makerom](https://github.com/3DSGuy/Project_CTR) and
 [bannertool](https://github.com/diasurgical/bannertool) on the `PATH` (or `MAKEROM=` / `BANNERTOOL=`).
 The icon, HOME menu banner and jingle are drawn by `meta/make_art.py`.
@@ -133,6 +135,44 @@ SIRC20, RC5, RC5X, RC6, Kaseikyo, Pioneer, RCA, and raw.
    N3DS XL) through a phone camera. Front cameras usually have no IR filter.
 2. **[Built-in test codes]**: hold the 3DS about 30 cm from the TV and send
    the Vol+ code for its brand.
+
+## Debug build
+
+The debug build adds:
+
+- **[IR chip diagnostic]**: stops the system's `ir` module and talks to the SC16IS750 directly
+  over `i2c::IR`, the way Prox3DS takes over the NFC controller. It logs every register (the
+  divisor, IrDA mode, the bridge's own GPIO pins) and the I2C round-trip time. Then it counts
+  what the RX FIFO receives, so you can point a remote at the port. B gives the hardware back
+  and relaunches the `ir` module. ZL/ZR and the C-stick (served by the same module) don't work
+  while it's taken over.
+- A log in `sdmc:/3dsir.log`.
+- A TCP server on port 8020 while Wi-Fi is up. The address is shown on the top screen.
+  `tools/irnet.py HOST ...` uses it to:
+  - update the app in place (`update`; it relaunches itself through Rosalina's `hb:ldr`),
+    copy `.ir` files onto the SD card (`put`), grab the top screen (`shot`), press
+    buttons (`keys`) and read the log (`log`);
+  - send codes through `ir:u` from a `.ir` file on the PC (`send FILE NAME`) or by
+    protocol (`code NEC 0x04 0x08`), or raw UART bytes (`irusend`);
+  - take the SC16IS750 over (`takeover` / `release`), read and write its registers (`regs`,
+    `rd`, `wr`), set any baud divisor with IrDA on or off (`uart`), push bytes through the
+    TX FIFO (`tx`, `txfill`), record what the RX FIFO receives with timestamps (`rx`),
+    time I2C (`bench`), and run raw GPIO, I2C and IPC commands (`gpio`, `i2c`, `ipc`).
+
+Still unverified on hardware: the I2C device ID (13, the 3dbrew number for bus 3 /
+0x9A), whether a register read works as a sub-address write followed by a separate read,
+and which `gpio:IR` bits do what.
+
+Example session:
+
+```
+tools/irnet.py 192.168.1.50 takeover
+tools/irnet.py 192.168.1.50 regs
+tools/irnet.py 192.168.1.50 uart 15 nrz        # 76800 baud, IrDA off
+tools/irnet.py 192.168.1.50 txfill 0x55 4000   # a 50% duty 38.4 kHz square wave?
+tools/irnet.py 192.168.1.50 rx 2000            # press a remote button at the port
+tools/irnet.py 192.168.1.50 release
+```
 
 ## Host test
 
