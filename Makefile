@@ -32,7 +32,7 @@ include $(DEVKITARM)/3ds_rules
 #     - <libctru folder>/default_icon.png
 #---------------------------------------------------------------------------------
 TARGET		:=	3dsir
-APP_TITLE	:=	3DSir
+APP_TITLE	:=	3DSir (Debug)
 APP_DESCRIPTION	:=	Universal TV remote via the IR port
 APP_AUTHOR	:=	doridian
 BUILD		:=	build
@@ -55,8 +55,15 @@ CFLAGS	:=	-g -Wall -O2 -mword-relocations \
 
 CFLAGS	+=	$(INCLUDE) -D__3DS__
 
-# make cia: the same build as an installable CIA, 3dsir.cia (makerom + bannertool on the PATH, or
-# MAKEROM= / BANNERTOOL=)
+# make: the debug build, 3dsir.3dsx (network server on TCP 8020, log in sdmc:/3dsir.log, IR chip
+# diagnostic). make release: 3dsir-release.3dsx without them.
+# make cia: the release build as an installable CIA, 3dsir-release.cia (makerom + bannertool on the
+# PATH, or MAKEROM= / BANNERTOOL=). There is no debug CIA.
+ifneq ($(RELEASE),)
+APP_TITLE	:=	3DSir
+CFLAGS	+=	-DAPP_RELEASE
+NOT_BUILT	:=	netsrv.c
+endif
 MAKEROM		?=	makerom
 BANNERTOOL	?=	bannertool
 
@@ -90,7 +97,7 @@ export VPATH	:=	$(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
 
 export DEPSDIR	:=	$(CURDIR)/$(BUILD)
 
-CFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+CFILES		:=	$(filter-out $(NOT_BUILT),$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c))))
 CPPFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
 SFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
 PICAFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.v.pica)))
@@ -166,13 +173,20 @@ ifneq ($(ROMFS),)
 	export _3DSXFLAGS += --romfs=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: all clean cia
+.PHONY: all clean release cia
 
 #---------------------------------------------------------------------------------
 all: $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
+release:
+	@$(MAKE) --no-print-directory RELEASE=1 BUILD=build-release TARGET=$(TARGET)-release
+
 # HOME menu banner (meta/banner.png + jingle) and icon (icon.png, as for the .3dsx); meta/make_art.py draws them
+ifeq ($(RELEASE),)
+cia:
+	@$(MAKE) --no-print-directory RELEASE=1 BUILD=build-release TARGET=$(TARGET)-release cia
+else
 cia: all
 	@$(BANNERTOOL) makebanner -i $(TOPDIR)/meta/banner.png -a $(TOPDIR)/meta/banner.wav -o $(BUILD)/banner.bnr
 	@$(BANNERTOOL) makesmdh -s "$(APP_TITLE)" -l "$(APP_DESCRIPTION)" -p "$(APP_AUTHOR)" \
@@ -180,6 +194,7 @@ cia: all
 	@$(MAKEROM) -f cia -o $(OUTPUT).cia -target t -exefslogo -elf $(OUTPUT).elf -rsf $(TOPDIR)/meta/3dsir.rsf \
 		-banner $(BUILD)/banner.bnr -icon $(BUILD)/icon.icn
 	@echo built ... $(notdir $(OUTPUT).cia)
+endif
 
 $(BUILD):
 	@mkdir -p $@
@@ -197,7 +212,8 @@ endif
 #---------------------------------------------------------------------------------
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).3dsx $(TARGET).cia $(OUTPUT).smdh $(TARGET).elf $(GFXBUILD)
+	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf $(GFXBUILD)
+	@rm -fr build-release $(TARGET)-release.3dsx $(TARGET)-release.cia $(TARGET)-release.smdh $(TARGET)-release.elf
 
 #---------------------------------------------------------------------------------
 $(GFXBUILD)/%.t3x	$(BUILD)/%.h	:	%.t3s
