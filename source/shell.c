@@ -412,12 +412,13 @@ void app_run(const Screen* root) {
         if(tap) ui_touch(true, false, tap & 0xFFFF, (tap >> 16) & 0x7FFF);
         else ui_touch(held == 1 || (held > 24 && held % 5 == 0), held > 1, tp.px, tp.py);
         job_reap();
-        if((down & KEY_START) && !busy) break;
-        if(busy) {
+        bool under = busy && (job_flags & JOB_SCREEN); // the screen runs as usual
+        if((down & KEY_START) && (!busy || under)) break;
+        if(busy && !under) {
             if((down & KEY_B) && (job_flags & JOB_CANCEL)) job_cancel = true;
         } else if(dlg.kind) {
             dialog_input(down, repeat);
-        } else if((down & KEY_SELECT) && stack[depth - 1] != &log_screen) {
+        } else if((down & KEY_SELECT) && !under && stack[depth - 1] != &log_screen) {
             app_open_log();
         } else {
             stack[depth - 1]->input(down, repeat);
@@ -426,8 +427,8 @@ void app_run(const Screen* root) {
 
         ui_frame_begin();
         stack[depth - 1]->draw();
-        bool box = busy && !(job_flags & JOB_QUIET);
-        if(busy) busy_draw();
+        bool box = busy && !(job_flags & (JOB_QUIET | JOB_SCREEN));
+        if(busy && !under) busy_draw();
         if(dlg.kind && !box) dialog_draw();
         if(box) ui_hints(job_flags & JOB_CANCEL ? BTN_B " stop" : "");
         if(frame < toast_until && !box && !dlg.kind) {
@@ -440,7 +441,7 @@ void app_run(const Screen* root) {
             ui_text_center(UI_W / 2, UI_H - 41, S_SMALL, ui_col[COL_TEXT], "%s", t);
         }
         ui_bottom();
-        if(!busy && !dlg.kind && stack[depth - 1]->bottom) stack[depth - 1]->bottom();
+        if((!busy || under) && !dlg.kind && stack[depth - 1]->bottom) stack[depth - 1]->bottom();
         else bottom_draw();
         ui_frame_end();
     }

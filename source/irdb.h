@@ -107,6 +107,10 @@ void irdb_find_reset(void);
 // candidates become the remotes that have the most of the codes pressed so far. Returns false (and changes
 // nothing) if no remote at all has this code with the earlier ones.
 bool irdb_find_press(const IrKey* k, int asked);
+// Asked for a button, the remote sent a code that the candidates (every remote, before the first press) only
+// know as another well-known button: that button (the one most of them call it), the user pressed the wrong
+// one. -1 if some candidate has it as the button asked for, or none has it under a well-known name.
+int irdb_find_known_as(const IrKey* k, int asked);
 // The user's remote has no such button: not asked again.
 void irdb_find_skip(int button);
 // The button that best tells the candidates apart (fewest expected left after it), -1 if none helps.

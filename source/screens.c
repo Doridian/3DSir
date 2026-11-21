@@ -624,15 +624,28 @@ static void open_db(void) {
 
 // ---------------------------------------------------------------- find my remote
 
-#define HIST 6
+// The finder listens the whole time it is on screen: a job (JOB_SCREEN) holds the IR receiver and hands each
+// capture over to the screen, which checks it against the button asked for and asks the next one right away.
+
+#define HIST 5
 
 static struct {
     int ask; // the button asked for (IRDB_BTN_OTHER: any)
     char hist[HIST][96]; // what each press found
     int nhist;
+    // The listener's handover: a capture waits in t/n while ready (the job thread doesn't touch it then).
     u32 t[512];
     size_t n;
+    volatile bool ready;
     Result rc;
+    bool listening, stopping, failed;
+    void (*then)(void); // once the listener has stopped
+    char msg[256]; // what the last press did
+    bool warn;
+    u64 msg_at; // now_ms()
+    IrKey last; // the last code taken: pressed again (a double press, held too long) it's ignored
+    bool have_last;
+    IrDecoded unknown; // the first press, which no remote sends
     UiList l; // the matches
 } fnd;
 
@@ -647,9 +660,27 @@ static void hist_add(const char* fmt, ...) {
     va_end(va);
 }
 
+static u64 now_ms(void) {
+    return svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000);
+}
+
+static void feedback(bool warn, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+static void feedback(bool warn, const char* fmt, ...) {
+    va_list va;
+    va_start(va, fmt);
+    vsnprintf(fnd.msg, sizeof(fnd.msg), fmt, va);
+    va_end(va);
+    fnd.warn = warn;
+    fnd.msg_at = now_ms();
+}
+
 static size_t finder_left(void) {
     const IrdbFile* const* c;
     return irdb_find_candidates(&c);
+}
+
+static const char* asked(void) {
+    return fnd.ask == IRDB_BTN_OTHER ? "any button" : irdb_button_label(fnd.ask);
 }
 
 static void show_matches(void) {
@@ -657,26 +688,57 @@ static void show_matches(void) {
     if(app_top() != &matches_screen) app_screen(&matches_screen);
 }
 
-// After a press or a skip: the next question, or the answer.
-static void finder_next(void) {
-    if(!irdb_find_presses()) return; // still the first press: Power, or any
-    int b = irdb_find_next();
-    if(b < 0 || finder_left() < 2) {
-        fnd.ask = IRDB_BTN_OTHER; // back from the matches, any press narrows them further
-        show_matches();
-        return;
-    }
-    fnd.ask = b;
-}
-
+// The listener (job thread): takes the receiver over once and captures press after press until stopped.
 static void listen_run(void) {
-    fnd.n = 0;
+    static u32 t[512];
     fnd.rc = app_hw_direct(IRHW_STEAL);
-    if(R_SUCCEEDED(fnd.rc)) fnd.n = app_learn_capture(fnd.t, sizeof(fnd.t) / sizeof(fnd.t[0]), &job_cancel);
+    if(R_FAILED(fnd.rc)) logp("takeover failed: %08lX\n", fnd.rc);
+    while(R_SUCCEEDED(fnd.rc) && !job_cancel) {
+        size_t n = app_learn_capture(t, sizeof(t) / sizeof(t[0]), &job_cancel);
+        if(job_cancel) break;
+        if(!n) { // the receiver failed (logged): don't spin
+            svcSleepThread(MS(200));
+            continue;
+        }
+        if(n < 4) continue; // a stray flash of light, not a remote
+        while(__atomic_load_n(&fnd.ready, __ATOMIC_ACQUIRE) && !job_cancel) svcSleepThread(MS(5));
+        memcpy(fnd.t, t, n * sizeof(*t));
+        fnd.n = n;
+        __atomic_store_n(&fnd.ready, true, __ATOMIC_RELEASE);
+    }
     app_hw_iru();
 }
 
-static void listen_start(void);
+static void listen_done(void) {
+    fnd.listening = fnd.stopping = false;
+    fnd.ready = false;
+    if(R_FAILED(fnd.rc)) {
+        fnd.failed = true; // not again by itself: B leaves
+        msg_box("Find my remote", "Couldn't take the IR receiver over (%08lX). This needs Luma3DS.", fnd.rc);
+        return;
+    }
+    void (*then)(void) = fnd.then;
+    fnd.then = NULL;
+    if(then) then();
+}
+
+static void listen_start(void) {
+    fnd.listening = true;
+    fnd.ready = false;
+    job_start("Listening", listen_run, listen_done, JOB_SCREEN);
+    if(!job_busy()) fnd.listening = false, fnd.failed = true; // no worker thread (said so)
+}
+
+// Stops listening, then calls then (NULL: nothing) on the UI thread.
+static void finder_stop(void (*then)(void)) {
+    if(!fnd.listening) {
+        if(then) then();
+        return;
+    }
+    fnd.then = then;
+    fnd.stopping = true;
+    job_cancel = true;
+}
 
 static void learn_instead(void) {
     learn.target = LEARN_NEW_REMOTE;
@@ -684,97 +746,193 @@ static void learn_instead(void) {
     app_screen(&learned_screen);
 }
 
-static void listen_done(void) {
-    if(job_cancel) return;
-    if(R_FAILED(fnd.rc)) {
-        msg_box("Find my remote", "Couldn't take the IR receiver over (%08lX). This needs Luma3DS.", fnd.rc);
+static void offer_learning(void) {
+    IrDecoded* d = &fnd.unknown;
+    learn.d = *d;
+    learn.n = fnd.n;
+    memset(&learn.sig, 0, sizeof(learn.sig));
+    snprintf(learn.sig.protocol, sizeof(learn.sig.protocol), "%s", d->protocol);
+    learn.sig.address = d->address;
+    learn.sig.command = d->command;
+    confirm("Not in the database", learn_instead,
+            "No remote in the database sends %s %02lX / %02lX.\n\nLearn your remote button by button instead, "
+            "starting with this one?\n\n(No: press another button to keep looking.)",
+            d->protocol, d->address, d->command);
+}
+
+// After a press or a skip: the next question, or the answer.
+static void finder_next(void) {
+    if(!irdb_find_presses()) return; // still the first press: Power, or any
+    u64 t0 = now_ms();
+    int b = irdb_find_next();
+    logp("find: %zu left, next %s (%llu ms)\n", finder_left(), b < 0 ? "-" : irdb_button_label(b), now_ms() - t0);
+    if(b < 0 || finder_left() < 2) {
+        fnd.ask = IRDB_BTN_OTHER; // back from the matches, any press narrows them further
+        finder_stop(show_matches);
         return;
     }
+    fnd.ask = b;
+}
+
+// A capture from the listener.
+static void finder_heard(void) {
     IrDecoded d;
     IrKey k;
     if(!ir_decode(fnd.t, fnd.n, &d) || !irdb_decoded_key(&d, &k)) {
-        confirm("Not recognized", listen_start, "%s\n\nTry again?", ir_decode_hint(fnd.t, fnd.n));
+        logp("find: %zu bursts, not recognized\n", fnd.n);
+        feedback(true, "Not recognized. %s\nPress %s again.", ir_decode_hint(fnd.t, fnd.n), asked());
+        return;
+    }
+    logp("find: %s -> %s %02lX / %02lX\n", irdb_button_label(fnd.ask), d.protocol, d.address, d.command);
+    if(fnd.have_last && irdb_same_code(&k, &fnd.last)) {
+        feedback(true, "That's the button you pressed before. Now press %s.", asked());
         return;
     }
     const char* what = irdb_button_label(fnd.ask);
-    logp("find: %s -> %s %02lX / %02lX\n", what, d.protocol, d.address, d.command);
+    int other = irdb_find_known_as(&k, fnd.ask);
+    if(other >= 0) {
+        feedback(true, "That's %s, not %s. Press %s, or " BTN_X " if your remote has none.", irdb_button_label(other),
+                 what, what);
+        return;
+    }
     size_t before = irdb_find_presses() ? finder_left() : irdb_detectable();
     if(!irdb_find_press(&k, fnd.ask)) {
         if(!irdb_find_presses()) {
-            // Nothing sends it: offer to learn the remote button by button, starting with this one.
-            learn.d = d;
-            learn.n = fnd.n;
-            memset(&learn.sig, 0, sizeof(learn.sig));
-            snprintf(learn.sig.protocol, sizeof(learn.sig.protocol), "%s", d.protocol);
-            learn.sig.address = d.address;
-            learn.sig.command = d.command;
-            confirm("Not in the database", learn_instead,
-                    "No remote in the database sends %s %02lX / %02lX.\n\nLearn your remote button by button instead, "
-                    "starting with this one?",
-                    d.protocol, d.address, d.command);
+            fnd.unknown = d;
+            feedback(true, "No remote sends %s %02lX / %02lX. Press another button (or learn your remote with "
+                     "Learn new remote).", d.protocol, d.address, d.command);
+            fnd.ask = IRDB_BTN_OTHER;
+            finder_stop(offer_learning);
             return;
         }
-        hist_add("%s: %s %02lX/%02lX, none of the %zu sends it", what, d.protocol, d.address, d.command, before);
-        toast("None of the matching remotes sends that code");
-        finder_next();
+        char who[48];
+        if(before == 1) snprintf(who, sizeof(who), "The remote left doesn't send");
+        else snprintf(who, sizeof(who), "None of the %zu remotes left sends", before);
+        if(fnd.ask == IRDB_BTN_OTHER)
+            feedback(true, "%s %s %02lX / %02lX. Try another button.", who, d.protocol, d.address, d.command);
+        else
+            feedback(true, "%s %s %02lX / %02lX. Press %s again, or " BTN_X " if your remote has none.", who,
+                     d.protocol, d.address, d.command, what);
         return;
     }
-    hist_add("%s: %s %02lX/%02lX, %zu remote%s left", what, d.protocol, d.address, d.command, finder_left(),
-             finder_left() == 1 ? "" : "s");
+    fnd.last = k;
+    fnd.have_last = true;
+    size_t left = finder_left();
+    hist_add("%s: %s %02lX/%02lX, %zu remote%s left", what, d.protocol, d.address, d.command, left,
+             left == 1 ? "" : "s");
+    feedback(false, "Got it: %s %02lX / %02lX, %zu remote%s left.", d.protocol, d.address, d.command, left,
+             left == 1 ? "" : "s");
     finder_next();
-}
-
-static void listen_start(void) {
-    job_start("Listening", listen_run, listen_done, JOB_CANCEL);
-    job_note("Point the remote at the IR port on the back of the 3DS, a few cm away, and press %s once.",
-             fnd.ask == IRDB_BTN_OTHER ? "any button" : irdb_button_label(fnd.ask));
 }
 
 static void finder_input(u32 down, u32 repeat) {
     (void)repeat;
-    if(down & KEY_A) listen_start();
-    if(down & KEY_X) { // the remote has no such button
-        if(fnd.ask == IRDB_BTN_OTHER) return;
-        irdb_find_skip(fnd.ask);
-        if(irdb_find_presses())
-            hist_add("%s: skipped, %zu remote%s left", irdb_button_label(fnd.ask), finder_left(),
-                     finder_left() == 1 ? "" : "s");
-        else
-            hist_add("%s: skipped", irdb_button_label(fnd.ask));
-        if(!irdb_find_presses()) fnd.ask = IRDB_BTN_OTHER;
-        else finder_next();
+    if(fnd.stopping) return;
+    if(__atomic_load_n(&fnd.ready, __ATOMIC_ACQUIRE)) {
+        finder_heard();
+        __atomic_store_n(&fnd.ready, false, __ATOMIC_RELEASE);
+        if(fnd.stopping) return;
     }
-    if((down & KEY_Y) && irdb_find_presses()) show_matches();
-    if(down & KEY_B) app_back();
+    if(down & KEY_B) {
+        finder_stop(app_back);
+        return;
+    }
+    if((down & KEY_X) && fnd.ask != IRDB_BTN_OTHER) { // the remote has no such button
+        const char* what = irdb_button_label(fnd.ask);
+        irdb_find_skip(fnd.ask);
+        if(irdb_find_presses()) {
+            size_t left = finder_left();
+            hist_add("%s: none, %zu remote%s left", what, left, left == 1 ? "" : "s");
+            feedback(false, "No %s: %zu remote%s left.", what, left, left == 1 ? "" : "s");
+            finder_next();
+        } else {
+            hist_add("%s: none", what);
+            feedback(false, "No %s.", what);
+            fnd.ask = IRDB_BTN_OTHER;
+        }
+        if(fnd.stopping) return;
+    }
+    if((down & KEY_Y) && irdb_find_presses()) {
+        finder_stop(show_matches);
+        return;
+    }
+    // Listening whenever the screen is up: on entering, after a dialog, back from the matches.
+    if(!fnd.listening && !fnd.failed && !job_busy()) listen_start();
 }
 
 static void finder_draw(void) {
-    char right[48], s[256];
+    char right[48], s[300];
     size_t left = irdb_find_presses() ? finder_left() : irdb_detectable();
     snprintf(right, sizeof(right), "%zu remote%s", left, left == 1 ? "" : "s");
     ui_header("Find my remote", right);
-    if(fnd.ask == IRDB_BTN_OTHER)
-        snprintf(s, sizeof(s), "Press " BTN_A ", then press any button on your remote.");
-    else
-        snprintf(s, sizeof(s), "Press " BTN_A ", then press %s on your remote.", irdb_button_label(fnd.ask));
-    ui_text_wrap(12, 32, UI_W - 24, S_BODY, ui_col[COL_ACCENT], s);
-    float y = 62;
-    if(!irdb_find_presses() && !fnd.nhist) {
-        ui_text_wrap(12, y, UI_W - 24, S_SMALL, ui_col[COL_TEXT],
-                     "A few presses pick your remote out of the database: each button asked for is the one that tells "
-                     "the remaining remotes apart best.\n\nHold the remote a few cm from the IR port on the back of "
-                     "the 3DS. Remotes with 36 kHz codes (RC5 / RC6, most Philips) can't be recognized.");
+
+    float y = 30;
+    if(fnd.failed) {
+        ui_text_center(UI_W / 2, y + 4, 0.8f, ui_col[COL_ERR], "Can't listen");
+    } else if(fnd.stopping || !fnd.listening) {
+        ui_text_center(UI_W / 2, y + 4, 0.8f, ui_col[COL_DIM], "One moment...");
+    } else {
+        snprintf(s, sizeof(s), "Press %s", asked());
+        ui_text_center(UI_W / 2, y + 4, 0.9f, ui_col[COL_ACCENT], "%s", ui_fit(s, UI_W - 24, 0.9f));
+        // a dot that breathes while listening
+        u32 ph = (now_ms() / 40) % 50, a = ph < 25 ? ph : 50 - ph;
+        u32 c = (ui_col[COL_ACCENT] & 0x00FFFFFF) | (0x50 + a * 7) << 24;
+        ui_rect(12, y + 14, 8, 8, c);
     }
-    for(int i = 0; i < fnd.nhist; i++, y += SMALL_H + 2) ui_text(12, y, S_SMALL, ui_col[COL_DIM], "%s", fnd.hist[i]);
-    if(irdb_find_presses())
-        ui_footer(BTN_A " listen   " BTN_X " don't have it   " BTN_Y " matches   " BTN_B " back");
+    ui_text_center(UI_W / 2, y + 34, S_SMALL, ui_col[COL_DIM], "%s",
+                   "on your remote, a few cm from the IR port on the back of the 3DS");
+    y += 54;
+
+    u64 age = now_ms() - fnd.msg_at;
+    if(*fnd.msg) { // until the next press
+        int lines = ui_wrap_lines(UI_W - 40, S_SMALL, fnd.msg);
+        float h = lines * SMALL_H + 8;
+        bool flash = fnd.warn && age < 600 && (age / 150) % 2 == 0;
+        u32 edge = ui_col[fnd.warn ? COL_WARN : COL_OK];
+        ui_rect(12, y, UI_W - 24, h, ui_col[flash ? COL_SEL : COL_PANEL]);
+        ui_rect(12, y, 3, h, edge);
+        ui_text_wrap(22, y + 4, UI_W - 40, S_SMALL, ui_col[fnd.warn ? COL_WARN : COL_TEXT], fnd.msg);
+        y += h + 6;
+    } else if(!irdb_find_presses() && !fnd.nhist) {
+        y = ui_text_wrap(12, y, UI_W - 24, S_SMALL, ui_col[COL_TEXT],
+                         "A few presses pick your remote out of the database: each button asked for is the one that "
+                         "tells the remaining remotes apart best. No button on the 3DS needed, just the remote's.\n"
+                         "Remotes with 36 kHz codes (RC5 / RC6, most Philips) can't be recognized.") + 6;
+    }
+    // what each press found, newest last, as far as there is room
+    int first = 0;
+    while(first < fnd.nhist && y + (fnd.nhist - first) * (SMALL_H + 2) > UI_H - 20) first++;
+    for(int i = first; i < fnd.nhist; i++, y += SMALL_H + 2)
+        ui_text(12, y, S_SMALL, ui_col[COL_DIM], "%s", fnd.hist[i]);
+
+    if(irdb_find_presses() && fnd.ask != IRDB_BTN_OTHER)
+        ui_footer(BTN_X " don't have it   " BTN_Y " matches   " BTN_B " back");
+    else if(irdb_find_presses())
+        ui_footer(BTN_Y " matches   " BTN_B " back");
     else if(fnd.ask != IRDB_BTN_OTHER)
-        ui_footer(BTN_A " listen   " BTN_X " no such button   " BTN_B " back");
+        ui_footer(BTN_X " don't have it   " BTN_B " back");
     else
-        ui_footer(BTN_A " listen   " BTN_B " back");
+        ui_footer(BTN_B " back");
 }
 
-static const Screen finder_screen = {NULL, finder_input, finder_draw, NULL};
+// Big touch buttons: no such button, the matches, back.
+static void finder_bottom(void) {
+    char s[64];
+    float y = 8;
+    if(fnd.ask != IRDB_BTN_OTHER) {
+        snprintf(s, sizeof(s), "My remote has no %s button", irdb_button_label(fnd.ask));
+        if(ui_button(8, y, UI_BW - 16, 56, ui_col[COL_BAR], s)) app_press(KEY_X);
+        y += 64;
+    }
+    if(irdb_find_presses()) {
+        size_t n = finder_left();
+        snprintf(s, sizeof(s), "Show the %zu match%s", n, n == 1 ? "" : "es");
+        if(ui_button(8, y, UI_BW - 16, 40, ui_col[COL_BAR], s)) app_press(KEY_Y);
+    }
+    if(ui_button(8, UI_H - 44, UI_BW - 16, 36, ui_col[COL_PANEL], "Back")) app_press(KEY_B);
+}
+
+static const Screen finder_screen = {NULL, finder_input, finder_draw, finder_bottom};
 
 // "irdb:/TVs/LG/LG_TV.ir" -> "TVs/LG/LG_TV", "sdmc:/3ds/3dsir/TVs/Mine.ir" -> "TVs/Mine"
 static void db_name(const char* path, char* out, size_t max) {

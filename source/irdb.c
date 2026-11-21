@@ -796,6 +796,26 @@ bool irdb_find_press(const IrKey* k, int asked) {
     return true;
 }
 
+int irdb_find_known_as(const IrKey* k, int asked) {
+    if(asked < 0 || asked >= NBUTTONS) return -1;
+    unsigned count[NBUTTONS] = {0};
+    size_t n = fd.presses ? fd.n : ix.n;
+    for(size_t i = 0; i < n; i++) {
+        const IrdbFile* f = fd.presses ? fd.cand[i] : &ix.f[i];
+        if(!fd.presses && f->library) continue;
+        for(uint32_t j = 0; j < f->nkeys; j++) {
+            const IrKey* c = &f->keys[j];
+            if(!irdb_same_code(c, k)) continue;
+            if(c->button == asked) return -1;
+            if(c->button < NBUTTONS) count[c->button]++;
+        }
+    }
+    int best = -1;
+    for(int b = 0; b < NBUTTONS; b++)
+        if(count[b] && (best < 0 || count[b] > count[best])) best = b;
+    return best;
+}
+
 void irdb_find_skip(int button) {
     if(button < 0 || button >= 64) return;
     fd.skipped[button] = true;
@@ -830,28 +850,32 @@ static int cmp_key(const void* a, const void* b) {
 int irdb_find_next(void) {
     if(fd.n < 2) return -1;
     const IrKey** codes = malloc(fd.n * sizeof(*codes));
+    const IrdbFile** nob = malloc(fd.n * sizeof(*nob)); // the candidates without the button
     int best = -1;
-    // Worth a press only if it leaves 15% fewer on average: past that, what's left is mostly the same remote
-    // filed again (tests/irdb_test.c on the Flipper-IRDB: 3.2 presses on average, and 0.95 would take 3.8
-    // to tell apart only 2% more).
-    double best_e = fd.n * 0.85;
+    // Worth a press only if it leaves 5% fewer on average (and at least half a remote): past that, what's
+    // left is mostly the same remote filed again (tests/irdb_test.c on the Flipper-IRDB: 1.98 presses on
+    // average, 3% left among remotes that differ somewhere; 15% fewer: 1.89 presses, 6%).
+    double best_e = fd.n * 0.95;
     if(best_e > fd.n - 0.5) best_e = fd.n - 0.5;
     for(int b = 0; b < NBUTTONS; b++) {
         if(fd.skipped[b]) continue;
-        // If the remote is candidate i, pressing b leaves those with i's code for b; if it hasn't one
-        // (as far as the database knows), nothing is learned.
+        // If the remote is candidate i, pressing b leaves those with i's code for b, and those without a b
+        // that send the same code under another name (irdb_find_press keeps them); if i hasn't a b (as far as
+        // the database knows), nothing is learned.
         size_t m = 0, none = 0;
         for(size_t i = 0; i < fd.n; i++) {
             const IrKey* c = code_for(fd.cand[i], b);
             if(c) codes[m++] = c;
-            else none++;
+            else nob[none++] = fd.cand[i];
         }
+        if(!m) continue;
         qsort(codes, m, sizeof(*codes), cmp_key);
         double sq = 0;
         for(size_t i = 0; i < m;) {
-            size_t j = i;
+            size_t j = i, also = 0;
             while(j < m && !cmp_key(&codes[i], &codes[j])) j++;
-            sq += (double)(j - i) * (j - i);
+            for(size_t k = 0; k < none; k++) also += has(nob[k], codes[i]);
+            sq += (double)(j - i) * (j - i + also);
             i = j;
         }
         double e = (sq + (double)none * fd.n) / fd.n;
@@ -861,5 +885,6 @@ int irdb_find_next(void) {
         }
     }
     free(codes);
+    free(nob);
     return best;
 }
