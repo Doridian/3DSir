@@ -18,6 +18,24 @@ volatile bool restart_requested;
 IrCarrierStyle style = IrCarrierDense;
 unsigned repeats = 3;
 
+// New 3DS: turn on the L2 cache, which speeds up memory-heavy work (IRDB indexing, parsing)
+// at no real battery cost. The 804 MHz clock (bit 0) is left off: that one does draw power.
+// HOME Menu resets the CPU config when it takes over, so reapply it whenever we come back.
+static bool is_new3ds;
+static aptHookCookie cpu_hook;
+
+static void cpu_config(bool on) {
+    if(!is_new3ds || R_FAILED(ptmSysmInit())) return;
+    Result rc = PTMSYSM_ConfigureNew3DSCPU(on ? 2 : 0); // bit 1: L2 cache
+    ptmSysmExit();
+    if(on && R_FAILED(rc)) logp("New 3DS L2 cache: %08lx\n", rc);
+}
+
+static void cpu_hook_fn(APT_HookType hook, void* param) {
+    (void)param;
+    if(hook == APTHOOK_ONRESTORE || hook == APTHOOK_ONWAKEUP) cpu_config(true);
+}
+
 static void settings_load(void) {
     FILE* f = fopen(SETTINGS_PATH, "r");
     if(!f) return;
@@ -79,6 +97,10 @@ int main(int argc, char* argv[]) {
     logp("app: %s\n", app_path);
     net_start();
 #endif
+    APT_CheckNew3DS(&is_new3ds);
+    cpu_config(true);
+    aptHook(&cpu_hook, cpu_hook_fn, NULL);
+    if(is_new3ds) logp("New 3DS: L2 cache on\n");
     mkdir(ROOT_DIR, 0777);
     irdb_init(ROOT_DIR, IRDB_CACHE, IRDB_PACK);
     settings_load();
@@ -102,6 +124,8 @@ int main(int argc, char* argv[]) {
     logp("--- exit ---\n");
     log_exit();
 
+    aptUnhook(&cpu_hook);
+    cpu_config(false);
     ui_exit();
     gfxExit();
     if(restart_requested) relaunch_self();
